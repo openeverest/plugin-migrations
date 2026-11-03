@@ -1,3 +1,4 @@
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { Accordion, AccordionDetails, AccordionSummary, Box, TextField, Typography } from '@mui/material';
 import type { EngineOptionsErrors } from '../../engine.types';
 import { PCSM_TUNING_FIELDS } from '../pcsm.constants';
@@ -16,7 +17,7 @@ export const TuningOptions = ({ value, errors, onChange, disabled }: TuningOptio
 
   return (
     <Accordion variant="outlined" disableGutters defaultExpanded={hasErrors}>
-      <AccordionSummary>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
         <Typography variant="subtitle1">{Messages.advanced}</Typography>
       </AccordionSummary>
       <AccordionDetails>

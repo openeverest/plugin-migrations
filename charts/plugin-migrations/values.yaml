@@ -59,6 +59,16 @@ engines:
       repository: percona/percona-clustersync-mongodb
       tag: "1.0.0"
       pullPolicy: IfNotPresent
+  # PostgreSQL → PostgreSQL with pgcopydb (worker: pgcopydb + an agent, see
+  # workers/pgcopydb). Experimental and off by default: pgcopydb v0.18 has open
+  # upstream issues in change replication; enable it for evaluation until a
+  # release with the fixes (v0.19) is in the worker image.
+  pgcopydb:
+    enabled: false
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-pgcopydb
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

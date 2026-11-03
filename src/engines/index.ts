@@ -1,8 +1,9 @@
 import type { Engine, OptionSummaryItem } from './engine.types';
 import { summarizeUnknownOptions } from './engines.utils';
 import { pcsmEngine } from './pcsm';
+import { pgcopydbEngine } from './pgcopydb';
 
-export const ENGINES: readonly Engine[] = [pcsmEngine];
+export const ENGINES: readonly Engine[] = [pcsmEngine, pgcopydbEngine];
 
 export function getEngine(id: string): Engine | undefined {
   return ENGINES.find((engine) => engine.id === id);

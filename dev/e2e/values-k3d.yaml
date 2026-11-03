@@ -11,3 +11,10 @@ worker:
       memory: 256Mi
     limits:
       memory: 1Gi
+engines:
+  pgcopydb:
+    enabled: true
+    image:
+      repository: plugin-migrations-pgcopydb
+      tag: e2e
+      pullPolicy: Never

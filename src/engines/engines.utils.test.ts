@@ -13,8 +13,10 @@ const descriptor = (id: string): EngineDescriptor => ({
 
 describe('availableEngines', () => {
   it('offers only engines known to both the UI registry and the backend', () => {
-    expect(availableEngines(ENGINES, [descriptor('pcsm'), descriptor('pgcopydb')]).map((e) => e.id)).toEqual(['pcsm']);
-    expect(availableEngines(ENGINES, [descriptor('pgcopydb')])).toEqual([]);
+    expect(availableEngines(ENGINES, [descriptor('pcsm'), descriptor('future-engine')]).map((e) => e.id)).toEqual([
+      'pcsm',
+    ]);
+    expect(availableEngines(ENGINES, [descriptor('future-engine')])).toEqual([]);
     expect(availableEngines(ENGINES, [])).toEqual([]);
   });
 });

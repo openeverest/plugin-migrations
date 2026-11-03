@@ -5,9 +5,11 @@ much like AWS DMS. A per-migration worker copies existing data (**full load**),
 keeps the target in sync with ongoing changes (**CDC**), and you trigger
 **cutover** when your application is ready to switch.
 
-> **Status: v0.1 draft.** The first engine is **MongoDB → MongoDB** built on
+> **Status: v0.1 draft.** Engines: **MongoDB → MongoDB** built on
 > [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-> (PCSM). The plugin appears in the OpenEverest **sidebar** only.
+> (PCSM), and an **experimental PostgreSQL → PostgreSQL** engine built on
+> [pgcopydb](https://github.com/dimitri/pgcopydb), off by default. The plugin
+> appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
 contract, and the HTTP API.
@@ -33,7 +35,10 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
    applied).
 3. **Cutover**: stop writes on the source, wait for lag ≈ 0, then click
    **Cutover**. PCSM finalizes the target (indexes and other catalog work).
-4. **Delete**: removes the worker. Data on the target is kept.
+4. **Delete**: removes the worker. Data on the target is kept. Engines that
+   leave state on the source or target (the pgcopydb replication slot and
+   origin) clean it up first; if that fails the deletion is refused, and
+   `DELETE /api/migrations/{id}?force=true` skips the cleanup.
 
 The backend has no database. Migration records are ConfigMaps, so migrations
 survive backend restarts and upgrades. Worker progress is checkpointed by the
@@ -44,11 +49,21 @@ engine itself (PCSM stores checkpoints in the target cluster).
 | Engine | Source | Target | Worker image |
 | --- | --- | --- | --- |
 | `pcsm` | MongoDB (OpenEverest `percona-server-mongodb` instance or external URI) | OpenEverest `percona-server-mongodb` instance | `percona/percona-clustersync-mongodb:1.0.0` |
+| `pgcopydb` (experimental) | One PostgreSQL database (OpenEverest `provider-percona-postgresql` instance or external URI) | OpenEverest `provider-percona-postgresql` instance | `ghcr.io/openeverest/plugin-migrations-pgcopydb` ([workers/pgcopydb](workers/pgcopydb)) |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
-worker tuning. See the options table in
-[docs/architecture.md](docs/architecture.md) (§8).
+worker tuning. pgcopydb options select the database, include/exclude schemas,
+exclude tables, replace existing objects on the target, and copy/index job
+counts. See the options tables in [docs/architecture.md](docs/architecture.md)
+(§8).
+
+> **pgcopydb engine status.** pgcopydb v0.18, the latest release, stalls and
+> has open data-loss issues in change replication; the fixes are merged on
+> upstream main for the next release (v0.19). The engine is disabled by default
+> and its worker image is built from v0.18; build it from upstream main
+> (`--build-arg PGCOPYDB_IMAGE=ghcr.io/dimitri/pgcopydb:latest`) to evaluate,
+> and switch to v0.19 once it is released.
 
 ### Adding an engine
 
@@ -77,6 +92,8 @@ Then open **Migrations** in the OpenEverest sidebar.
 | --- | --- | --- |
 | `engines.pcsm.enabled` | Enable the MongoDB (PCSM) engine | `true` |
 | `engines.pcsm.image.*` | PCSM worker image | `percona/percona-clustersync-mongodb:1.0.0` |
+| `engines.pgcopydb.enabled` | Enable the experimental PostgreSQL (pgcopydb) engine | `false` |
+| `engines.pgcopydb.image.*` | pgcopydb worker image (released with the plugin) | `ghcr.io/openeverest/plugin-migrations-pgcopydb:<chart version>` |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
@@ -96,6 +113,14 @@ Then open **Migrations** in the OpenEverest sidebar.
   questions in [docs/architecture.md](docs/architecture.md) (§11).
 - Deleting a migration does not remove PCSM's bookkeeping database from the
   target.
+- pgcopydb migrates one database per migration; it keeps its name on the
+  target, where it is created if missing. The source needs `wal_level=logical`
+  and a user with `REPLICATION` and read access; the worker keeps a heartbeat
+  table in a `pgcopydb` schema on the source (never migrated). Targets must
+  publish a superuser connection (`provider-percona-postgresql` does; disable
+  its PgBouncer or use session pooling). Object owners and grants are not
+  copied (`--no-owner --no-acl`). A worker restart before the cutover loses the
+  local pgcopydb state: the migration then fails and must be recreated.
 
 ## Development
 
@@ -104,6 +129,7 @@ npm install
 make frontend     # tsc + vite build (dist/main.js) + vitest
 make backend      # gofmt + go vet + go test + go build
 make helm-lint
+(cd workers/pgcopydb && go test ./...)   # pgcopydb worker agent
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```
 

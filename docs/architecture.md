@@ -100,6 +100,12 @@ type Controller interface {
     Resume(ctx) error                               // engine decides how to resume (e.g. PCSM fromFailure)
     Cutover(ctx) error                              // PCSM: /finalize
 }
+
+// engine.Teardowner: optional, for controllers whose workers leave state on
+// the source or target (pgcopydb: replication slot, origin, heartbeat row).
+type Teardowner interface {
+    Teardown(ctx) error
+}
 ```
 
 `Prepare` receives the resolved endpoint connections (URI, username, password,
@@ -224,8 +230,11 @@ it later (for GitOps) without changing the domain service.
    `startedAt`. The migration therefore starts even when the browser is closed.
 3. **Act** (`pause`/`resume`/`cutover`): check the caller's access, check the
    action is allowed for the live phase, then call the controller.
-4. **Delete**: delete the ConfigMap. The worker stops and data already written
-   to the target is kept.
+4. **Delete**: if the migration was started and its controller implements
+   `engine.Teardowner`, call `Teardown` first; a failure refuses the deletion
+   (`502`) so a replication slot is never orphaned silently, and `force=true`
+   skips it. Then delete the ConfigMap. The worker stops and data already
+   written to the target is kept.
 
 ## 7. Security
 
@@ -309,7 +318,10 @@ allowed in the current phase.
 
 ### `DELETE /api/migrations/{id}`
 
-`204`. Stops and removes the worker. Data on the target is kept.
+`204`. Stops and removes the worker. Data on the target is kept. Engines with
+teardown (pgcopydb) first drop what they created on the source and target;
+`502` if that fails. `?force=true` skips the teardown, e.g. when the source no
+longer exists; clean up the replication slot manually then.
 
 ### `Migration`
 
@@ -355,6 +367,29 @@ unknown. `source.display` is set only for external sources.
 | `clone.numReadWorkers` | `int` (1–256) | PCSM default | `cloneNumReadWorkers` |
 | `clone.numInsertWorkers` | `int` (1–256) | PCSM default | `cloneNumInsertWorkers` |
 | `replication.numWorkers` | `int` (1–256) | PCSM default | `replNumWorkers` |
+
+### pgcopydb engine options (`engine: "pgcopydb"`, experimental)
+
+| Field | Type | Default | pgcopydb |
+| --- | --- | --- | --- |
+| `database` | `string` | database in the source URI; required for an instance source | source and target database (same name) |
+| `includeSchemas` | `string[]` (unquoted names) | `[]` (all) | `[include-only-schema]` filter |
+| `excludeSchemas` | `string[]`; not with `includeSchemas` | `[]` | `[exclude-schema]` filter |
+| `excludeTables` | `string[]` (`schema.table`) | `[]` | `[exclude-table]` filter |
+| `dropIfExists` | `bool` | `false` | `--drop-if-exists` |
+| `tableJobs` | `int` (1–64) | pgcopydb default | `--table-jobs` |
+| `indexJobs` | `int` (1–64) | pgcopydb default | `--index-jobs` |
+
+The worker ([workers/pgcopydb](../workers/pgcopydb)) is pgcopydb plus a small
+agent that serves the control API. It runs `pgcopydb clone --follow` with a
+per-migration slot and origin (`pgcopydb_<migration id>`), `--no-owner
+--no-acl`, and always excludes the `pgcopydb` schema, where it keeps a
+heartbeat row on the source. Heartbeats (every 5s) give the lag in seconds and
+let a cutover finish on an idle source. Pause/resume toggle pgcopydb's apply
+mode (receiving continues, so the slot does not retain WAL), and cutover sets
+the end position to the source's current WAL flush position. After the
+cutover, and on delete, the agent drops the slot, the origin and the heartbeat
+row.
 
 ## 9. UI (sidebar only in v0.1)
 
@@ -408,6 +443,14 @@ unknown. `source.display` is set only for external sources.
    completed migration's worker keeps running until its record is deleted, so
    the backend rejects a new migration while the target has any migration
    record or a worker pod that is still shutting down.
+6. **pgcopydb release.** v0.18 stalls in change replication (the apply
+   pipeline is not flushed) and has open data-loss issues; upstream main fixes
+   them for v0.19. The engine stays experimental and disabled by default until
+   the worker image uses that release.
+7. **pgcopydb worker restarts.** The worker keeps pgcopydb's catalogs and CDC
+   files on local disk. A restart before the cutover loses them; the agent
+   detects its existing slot and fails the migration instead of skipping
+   changes. A volume for the work directory would make restarts resumable.
 
 ## 12. Roadmap
 
@@ -416,6 +459,8 @@ unknown. `source.display` is set only for external sources.
   `clusterDetailTab` on target instances.
 - v0.3: HA workers (2 replicas, PCSM lease), post-cutover validation (counts and
   sample hashes), PCSM state cleanup on delete.
-- Next engines: PostgreSQL (logical replication / pgcopydb), MySQL (Percona
-  XtraBackup + replication, or a binlog-based CDC tool).
+- PostgreSQL (pgcopydb): move to v0.19, persistent work directory, and
+  CloudNativePG targets (needs a superuser or granted replication-origin
+  privileges).
+- Next engines: MySQL/MariaDB (mydumper + native replication).
 - Optional Migration CRD and controller for GitOps.

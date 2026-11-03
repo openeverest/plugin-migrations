@@ -33,12 +33,6 @@ export function isPcsmOptionsDraft(value: unknown): value is PcsmOptionsDraft {
   );
 }
 
-/** Splits pasted input such as "a, b.c d.*" into individual namespaces. */
-export function splitNamespaceInput(values: readonly string[]): string[] {
-  const entries = values.flatMap((value) => value.split(/[\s,]+/)).filter((value) => value !== '');
-  return [...new Set(entries)];
-}
-
 export function isValidNamespace(namespace: string): boolean {
   return NAMESPACE_PATTERN.test(namespace);
 }

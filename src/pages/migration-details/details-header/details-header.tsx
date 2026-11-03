@@ -8,11 +8,12 @@ interface DetailsHeaderProps {
   name: string;
   phase?: MigrationPhase;
   subtitle?: string;
+  status?: ReactNode;
   actions?: ReactNode;
   onBack: () => void;
 }
 
-export const DetailsHeader = ({ name, phase, subtitle, actions, onBack }: DetailsHeaderProps) => (
+export const DetailsHeader = ({ name, phase, subtitle, status, actions, onBack }: DetailsHeaderProps) => (
   <Box>
     <Button size="small" onClick={onBack} sx={{ mb: 1, ml: -1 }}>
       {Messages.back}
@@ -26,10 +27,15 @@ export const DetailsHeader = ({ name, phase, subtitle, actions, onBack }: Detail
       </Box>
       {actions}
     </Box>
-    {subtitle && (
-      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-        {subtitle}
-      </Typography>
+    {(subtitle || status) && (
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mt: 0.5, flexWrap: 'wrap' }}>
+        {subtitle && (
+          <Typography variant="body2" color="text.secondary">
+            {subtitle}
+          </Typography>
+        )}
+        {status}
+      </Box>
     )}
   </Box>
 );

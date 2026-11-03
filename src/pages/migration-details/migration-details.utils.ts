@@ -1,8 +1,5 @@
 import type { Migration } from '../../api/migrations.types';
-import { engineLabel } from '../../engines';
-import { formatRelativeTime } from '../../utils/format.utils';
 import { CHANGE_REPLICATION_PHASES, PHASE_STEP_INDEX } from './migration-details.constants';
-import { Messages } from './migration-details.messages';
 import type { PhaseAnnotation, PhaseStepperState } from './migration-details.types';
 
 // failed/unknown do not say where the migration stopped, so infer the step from
@@ -28,9 +25,4 @@ export function phaseStepperState(migration: Migration): PhaseStepperState {
 
 export function isChangeReplicationPhase(migration: Migration): boolean {
   return CHANGE_REPLICATION_PHASES.includes(migration.phase);
-}
-
-export function detailsSubtitle(migration: Migration): string {
-  const engine = engineLabel(migration.engine);
-  return migration.observedAt ? `${engine} · ${Messages.updated(formatRelativeTime(migration.observedAt))}` : engine;
 }

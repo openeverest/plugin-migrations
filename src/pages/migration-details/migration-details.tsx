@@ -4,6 +4,8 @@ import { getMigration } from '../../api/migrations';
 import type { Migration } from '../../api/migrations.types';
 import type { NavigateFn } from '../../hooks/plugin-navigation.types';
 import { usePolling } from '../../hooks/use-polling';
+import { LiveIndicator } from '../../components/live-indicator/live-indicator';
+import { engineLabel } from '../../engines';
 import { CutoverDialog } from './cutover-dialog/cutover-dialog';
 import { DeleteDialog } from './delete-dialog/delete-dialog';
 import { DetailsHeader } from './details-header/details-header';
@@ -11,7 +13,7 @@ import { EndpointsCard } from './endpoints-card/endpoints-card';
 import { MigrationActions } from './migration-actions/migration-actions';
 import { DETAILS_POLL_INTERVAL_MS } from './migration-details.constants';
 import { Messages } from './migration-details.messages';
-import { detailsSubtitle, phaseStepperState } from './migration-details.utils';
+import { phaseStepperState } from './migration-details.utils';
 import { OptionsCard } from './options-card/options-card';
 import { PhaseStepper } from './phase-stepper/phase-stepper';
 import { ProgressCard } from './progress-card/progress-card';
@@ -25,7 +27,7 @@ interface MigrationDetailsProps {
 
 export const MigrationDetails = ({ id, onNavigate }: MigrationDetailsProps) => {
   const load = useCallback((signal: AbortSignal) => getMigration(id, signal), [id]);
-  const { data: migration, error, refresh, setData } = usePolling(load, DETAILS_POLL_INTERVAL_MS, id);
+  const { data: migration, error, lastUpdatedAt, refresh, setData } = usePolling(load, DETAILS_POLL_INTERVAL_MS, id);
   const goToList = useCallback(() => onNavigate({ kind: 'list' }), [onNavigate]);
   const onUpdated = useCallback((updated: Migration) => setData(updated), [setData]);
   const actions = useMigrationActions(id, { onUpdated, onDeleted: goToList });
@@ -64,7 +66,8 @@ export const MigrationDetails = ({ id, onNavigate }: MigrationDetailsProps) => {
       <DetailsHeader
         name={migration.name}
         phase={migration.phase}
-        subtitle={detailsSubtitle(migration)}
+        subtitle={engineLabel(migration.engine)}
+        status={<LiveIndicator lastUpdatedAt={lastUpdatedAt} stale={Boolean(error)} />}
         onBack={goToList}
         actions={
           <MigrationActions allowedActions={migration.allowedActions} disabled={busy} onAction={actions.request} />

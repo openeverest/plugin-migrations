@@ -5,6 +5,8 @@ export interface PollingState<T> {
   data: T | undefined;
   error: string | undefined;
   loading: boolean;
+  // Client time of the last successful load; unaffected by server clock skew.
+  lastUpdatedAt: Date | undefined;
   refresh: () => void;
   setData: (data: T) => void;
 }
@@ -21,11 +23,13 @@ export function usePolling<T>(
   const [data, setData] = useState<T>();
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(true);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<Date>();
   const [generation, setGeneration] = useState(0);
 
   useEffect(() => {
     setData(undefined);
     setError(undefined);
+    setLastUpdatedAt(undefined);
   }, [key]);
 
   useEffect(() => {
@@ -41,6 +45,7 @@ export function usePolling<T>(
         if (!active) return;
         setData(next);
         setError(undefined);
+        setLastUpdatedAt(new Date());
       } catch (err) {
         if (!active || controller.signal.aborted) return;
         setError(errorMessage(err));
@@ -59,5 +64,5 @@ export function usePolling<T>(
 
   const refresh = useCallback(() => setGeneration((value) => value + 1), []);
 
-  return { data, error, loading, refresh, setData };
+  return { data, error, loading, lastUpdatedAt, refresh, setData };
 }

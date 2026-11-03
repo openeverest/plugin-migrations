@@ -6,7 +6,6 @@ export const Messages = {
   retry: 'Retry',
   loadError: (message: string) => `Could not load the migration: ${message}`,
   actionError: (message: string) => `The action failed: ${message}`,
-  updated: (relative: string) => `Updated ${relative}`,
   steps: {
     provisioning: 'Provisioning',
     fullLoad: 'Full load',

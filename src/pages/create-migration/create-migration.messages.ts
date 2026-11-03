@@ -1,0 +1,60 @@
+import type { WizardStep } from './create-migration.types';
+
+export const Messages = {
+  title: 'Create migration',
+  back: 'Back',
+  next: 'Next',
+  create: 'Create migration',
+  creating: 'Creating…',
+  cancel: 'Cancel',
+  retry: 'Retry',
+  loadError: (message: string) => `Could not load migration settings: ${message}`,
+  createError: (message: string) => `Could not create the migration: ${message}`,
+  noEngines: 'No migration engines are enabled. Enable an engine in the plugin Helm values.',
+  steps: {
+    engine: 'Engine',
+    source: 'Source',
+    target: 'Target',
+    options: 'Options',
+    review: 'Review',
+  } satisfies Record<WizardStep, string>,
+  name: {
+    label: 'Name',
+    helper: 'Lowercase letters, digits and "-", up to 40 characters.',
+    required: 'Enter a name.',
+    tooLong: (max: number) => `Use at most ${max} characters.`,
+    invalid: 'Use lowercase letters, digits and "-", starting and ending with a letter or digit.',
+  },
+  engine: {
+    heading: 'Choose an engine',
+    required: 'Select an engine.',
+  },
+  source: {
+    heading: 'Where is the data now?',
+    instance: 'OpenEverest instance',
+    instanceLabel: 'Source instance',
+    required: 'Select a source instance.',
+  },
+  target: {
+    heading: 'Where should the data go?',
+    instanceLabel: 'Target instance',
+    required: 'Select a target instance.',
+  },
+  noInstances: 'No compatible instances are available in this cluster.',
+  options: {
+    heading: 'Migration options',
+    invalid: 'Fix the highlighted options.',
+  },
+  review: {
+    heading: 'Review',
+    settings: 'Migration',
+    options: 'Options',
+    name: 'Name',
+    engine: 'Engine',
+    source: 'Source',
+    caCert: 'Source CA certificate',
+    caProvided: 'Provided',
+    caNotProvided: 'Not provided',
+    target: 'Target',
+  },
+};

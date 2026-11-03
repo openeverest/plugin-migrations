@@ -1,0 +1,6 @@
+apiVersion: v2
+name: plugin-migrations
+description: OpenEverest plugin for migrating databases into OpenEverest with minimal downtime
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

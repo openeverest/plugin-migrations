@@ -1,0 +1,44 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "plugin-migrations.workloadRoleName" . }}
+  namespace: {{ include "plugin-migrations.workloadNamespace" . | quote }}
+  labels:
+    {{- include "plugin-migrations.labels" . | nindent 4 }}
+rules:
+  # Migration records; deleting one garbage-collects its worker.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "update", "delete"]
+  # Worker objects, created once per migration and owned by its record.
+  - apiGroups: [""]
+    resources: ["secrets", "services"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # update: scale the worker from 0 to 1 once its bootstrap Job succeeded.
+    verbs: ["create", "get", "update"]
+  # One-shot bootstrap that clears state a previous migration left on the target.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+  # Refuse a new migration while an earlier worker for the same target still runs.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "plugin-migrations.workloadRoleName" . }}
+  namespace: {{ include "plugin-migrations.workloadNamespace" . | quote }}
+  labels:
+    {{- include "plugin-migrations.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "plugin-migrations.fullname" . }}
+    namespace: {{ .Release.Namespace | quote }}
+roleRef:
+  kind: Role
+  name: {{ include "plugin-migrations.workloadRoleName" . }}
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,13 @@
+# Slim values for the local k3d end-to-end test.
+image:
+  repository: plugin-migrations
+  tag: e2e
+  pullPolicy: Never
+reconcileInterval: 3s
+worker:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

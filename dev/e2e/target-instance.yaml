@@ -1,0 +1,27 @@
+# Smallest useful OpenEverest MongoDB target: one replica-set member.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: orders
+  namespace: shop
+spec:
+  providerRef:
+    name: percona-server-mongodb
+  components:
+    engine:
+      type: mongod
+      replicas: 1
+      resources:
+        requests:
+          cpu: 200m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+      storage:
+        size: 2Gi

@@ -1,0 +1,22 @@
+export const Messages = {
+  title: 'Migrations',
+  subtitle: 'Move data into OpenEverest with a full load followed by continuous replication until cutover.',
+  create: 'Create migration',
+  retry: 'Retry',
+  loadError: (message: string) => `Could not load migrations: ${message}`,
+  emptyTitle: 'No migrations yet',
+  emptyDescription: 'Create a migration to copy a database into an OpenEverest instance and keep it in sync until you cut over.',
+  columns: {
+    name: 'Name',
+    engine: 'Engine',
+    endpoints: 'Source → Target',
+    phase: 'Phase',
+    progress: 'Progress',
+    created: 'Created',
+  },
+  endpoints: (source: string, target: string) => `${source} → ${target}`,
+  copied: (copied: string, total: string) => `${copied} / ${total}`,
+  copiedUnknownTotal: (copied: string) => `${copied} copied`,
+  lag: (lag: string) => `Lag ${lag}`,
+  noProgress: '—',
+};

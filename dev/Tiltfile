@@ -1,0 +1,190 @@
+# Tiltfile for developing this OpenEverest generic plugin.
+#
+# Installs the latest released OpenEverest v2 core, then builds this plugin's
+# frontend bundle + backend image and deploys the plugin chart with rebuild on
+# change. You do NOT need a local checkout of the core.
+#
+# Usage:
+#   make dev-up            # create the k3d cluster and run `tilt up`
+#   tilt up -f dev/Tiltfile
+#
+# See dev/.env.example for configuration. To develop against a core built from
+# source, set INSTALL_OPENEVEREST=false and run the core in a separate Tilt
+# instance.
+
+# ===========================
+# Utilities
+# ===========================
+def str2bool(v):
+    return str(v).lower() in ("yes", "true", "t", "1")
+
+# ===========================
+# Settings
+# ===========================
+# The OpenEverest core chart installs CRDs and multiple workloads; 30s (the
+# default) is not enough if container images are not cached on cold start.
+update_settings(k8s_upsert_timeout_secs=120)
+
+# ===========================
+# Configuration (.env)
+# ===========================
+load('ext://dotenv', 'dotenv')
+local_env_file = '{0}/.env'.format(config.main_dir)
+if os.path.exists(local_env_file):
+    print('Loading local .env file={0}'.format(local_env_file))
+    dotenv(fn=local_env_file)
+
+# Whether to install the released OpenEverest core. Set to false when you run
+# the core from source in a separate Tilt instance.
+install_openeverest = str2bool(os.getenv('INSTALL_OPENEVEREST', 'true'))
+
+# Released OpenEverest core version to install. Empty means latest.
+openeverest_version = os.getenv('OPENEVEREST_VERSION', '')
+
+# Helm repository that hosts the OpenEverest core chart.
+openeverest_helm_repo = os.getenv(
+    'OPENEVEREST_HELM_REPO', 'https://openeverest.github.io/helm-charts/')
+
+# Namespaces.
+everest_namespace = os.getenv('EVEREST_NAMESPACE', 'everest-system')
+plugin_namespace = os.getenv('PLUGIN_NAMESPACE', 'everest-system')
+
+# Command that builds the ESM frontend bundle into dist/main.js.
+plugin_build_cmd = os.getenv('PLUGIN_BUILD_CMD', 'npm run build')
+
+# Optional override for the Everest API URL the backend calls. Empty uses the
+# chart default (http://everest.everest-system.svc.cluster.local:8080).
+everest_api_url = os.getenv('EVEREST_API_URL', '')
+
+# Initial admin password for the Everest UI/API.
+ui_admin_password = os.getenv('UI_ADMIN_PASSWORD', 'admin')
+
+# ===========================
+# Paths
+# ===========================
+plugin_dir = os.path.realpath('{0}/..'.format(config.main_dir))
+chart_dir = '{0}/charts/plugin-migrations'.format(plugin_dir)
+print('Using plugin dir: {0}'.format(plugin_dir))
+print('Using plugin chart dir: {0}'.format(chart_dir))
+
+# ===========================
+# External cluster / registry
+# ===========================
+k8s_context = os.getenv('K8S_CONTEXT', '')
+if k8s_context:
+    print('Using Kubernetes context: {0}'.format(k8s_context))
+    allow_k8s_contexts(k8s_context)
+
+docker_registry_url = os.getenv('DOCKER_REGISTRY_URL', '')
+if docker_registry_url:
+    print('Using Docker registry URL: {0}'.format(docker_registry_url))
+    default_registry(docker_registry_url)
+
+# ===========================
+# Extensions
+# ===========================
+load('ext://helm_resource', 'helm_resource', 'helm_repo')
+
+# ===========================
+# OpenEverest core (released)
+# ===========================
+# Installed with a real `helm upgrade --install` (via the helm_resource
+# extension) so that the core CRDs bundled in the chart — including the
+# extensions.openeverest.io Plugin CRD this plugin registers against — are
+# applied correctly.
+if install_openeverest:
+    helm_repo(
+        'openeverest-repo',
+        openeverest_helm_repo,
+        labels=['openeverest'],
+    )
+
+    core_flags = [
+        '--create-namespace',
+        '--set', 'server.initialAdminPassword={0}'.format(ui_admin_password),
+        '--set', 'telemetry=false',
+        '--set', 'upgrade.preflightChecks=false',
+        # Keep the dev install lean: skip kube-state-metrics and default
+        # monitoring resources, but keep the victoria-metrics-operator subchart
+        # enabled (its CRDs are watched unconditionally at startup) by scaling
+        # its Deployment to 0 rather than disabling it.
+        '--set', 'kube-state-metrics.enabled=false',
+        '--set', 'monitoring.replicaCount=0',
+        '--set', 'createMonitoringResources=false',
+    ]
+    if openeverest_version:
+        core_flags = core_flags + ['--version', openeverest_version]
+
+    helm_resource(
+        'openeverest',
+        'openeverest-repo/openeverest',
+        release_name='everest',
+        namespace=everest_namespace,
+        flags=core_flags,
+        port_forwards=[port_forward(8080, 8080, 'Everest UI/API')],
+        resource_deps=['openeverest-repo'],
+        labels=['openeverest'],
+    )
+
+# ===========================
+# Plugin: build the frontend bundle
+# ===========================
+# The backend embeds dist/main.js (go:embed), so the bundle must exist before
+# the image is built. This runs on any change under src/ and rebuilds it.
+local_resource(
+    'plugin-migrations-frontend',
+    'cd {0} && {1}'.format(plugin_dir, plugin_build_cmd),
+    deps=[
+        '{0}/src'.format(plugin_dir),
+        '{0}/package.json'.format(plugin_dir),
+        '{0}/vite.config.ts'.format(plugin_dir),
+        '{0}/tsconfig.json'.format(plugin_dir),
+    ],
+    labels=['plugin-migrations'],
+)
+
+# ===========================
+# Plugin: backend image
+# ===========================
+# The existing Dockerfile compiles the Go backend and embeds the pre-built
+# bundle + icon from the build context. `only` scopes the context so unrelated
+# edits don't trigger a rebuild.
+plugin_image = 'ghcr.io/openeverest/plugin-migrations:tilt-dev'
+docker_build(
+    plugin_image,
+    context=plugin_dir,
+    dockerfile='{0}/Dockerfile'.format(plugin_dir),
+    only=[
+        'backend',
+        'dist/main.js',
+    ],
+)
+
+# ===========================
+# Plugin: Helm chart
+# ===========================
+# Deployed with a real `helm upgrade --install` (via the helm_resource
+# extension). Tilt injects the locally built image into the chart's
+# image.repository/image.tag values. helm_resource also guarantees the Plugin CR
+# is applied only after the core CRDs exist.
+plugin_flags = [
+    '--create-namespace',
+    '--set', 'image.pullPolicy=IfNotPresent',
+]
+if everest_api_url:
+    plugin_flags = plugin_flags + ['--set', 'everestAPIURL={0}'.format(everest_api_url)]
+
+plugin_resource_deps = ['plugin-migrations-frontend']
+if install_openeverest:
+    plugin_resource_deps = plugin_resource_deps + ['openeverest']
+
+helm_resource(
+    'plugin-migrations',
+    chart_dir,
+    namespace=plugin_namespace,
+    flags=plugin_flags,
+    image_deps=[plugin_image],
+    image_keys=[('image.repository', 'image.tag')],
+    resource_deps=plugin_resource_deps,
+    labels=['plugin-migrations'],
+)

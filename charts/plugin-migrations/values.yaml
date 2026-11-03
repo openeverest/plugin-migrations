@@ -1,0 +1,73 @@
+# Must stay 1: the one-active-migration-per-target check is serialized inside
+# the backend process. Migration state itself lives in Kubernetes objects.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/openeverest/plugin-migrations
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  port: 8080
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+plugin:
+  displayName: "Migrations"
+  description: "Migrate databases into OpenEverest with full load and change data capture."
+  vendor: "OpenEverest"
+  enabled: true
+  bundlePath: "/main.js"
+  icon: "/icon.svg"
+  extensionPoints:
+    - type: route
+      path: /migrations
+      label: Migrations
+    - type: sidebarItem
+      label: Migrations
+      icon: "/icon.svg"
+
+# OpenEverest API URL. Empty auto-discovers the in-cluster "everest" Service.
+everestAPIURL: ""
+
+# Namespace holding migration records (ConfigMaps) and their workers
+# (Deployment, Service, Secret). Empty uses the release namespace.
+workload:
+  namespace: ""
+  # Set to true only when Helm may create the configured workload namespace.
+  createNamespace: false
+
+# How often the backend refreshes worker status and starts new migrations.
+reconcileInterval: 5s
+
+# Compiled-in migration engines and their worker images. At least one engine
+# must be enabled. Disabling an engine leaves its existing workers running but
+# makes them unmanageable from the UI until it is re-enabled.
+engines:
+  pcsm:
+    enabled: true
+    image:
+      repository: percona/percona-clustersync-mongodb
+      tag: "1.0.0"
+      pullPolicy: IfNotPresent
+
+# Applied to every migration worker.
+worker:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+  nodeSelector: {}
+  tolerations: []
+  imagePullSecrets: []

@@ -1,0 +1,11 @@
+{{- if and .Values.workload.createNamespace .Values.workload.namespace (ne .Values.workload.namespace .Release.Namespace) }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "plugin-migrations.workloadNamespace" . | quote }}
+  labels:
+    {{- include "plugin-migrations.labels" . | nindent 4 }}
+  annotations:
+    # Running migrations must survive an accidental uninstall.
+    helm.sh/resource-policy: keep
+{{- end }}

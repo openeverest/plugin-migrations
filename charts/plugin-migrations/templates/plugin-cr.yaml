@@ -1,0 +1,27 @@
+apiVersion: extensions.openeverest.io/v1alpha1
+kind: Plugin
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  displayName: {{ .Values.plugin.displayName | quote }}
+  description: {{ .Values.plugin.description | quote }}
+  version: {{ .Chart.AppVersion | quote }}
+  vendor: {{ .Values.plugin.vendor | quote }}
+  enabled: {{ .Values.plugin.enabled }}
+  icon: {{ .Values.plugin.icon | quote }}
+  backend:
+    serviceRef:
+      namespace: {{ .Release.Namespace | quote }}
+      name: {{ include "plugin-migrations.fullname" . }}
+      port: {{ .Values.service.port }}
+  frontend:
+    bundlePath: {{ .Values.plugin.bundlePath | quote }}
+    extensionPoints:
+      {{- toYaml .Values.plugin.extensionPoints | nindent 6 }}
+  permissions:
+    - verb: read
+      resource: namespaces
+    - verb: read
+      resource: instances
+    - verb: read-connection
+      resource: instances

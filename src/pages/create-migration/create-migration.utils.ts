@@ -3,14 +3,29 @@ import type { CreateMigrationRequest, SourceEndpointInput } from '../../api/migr
 import type { Engine, OptionSummaryItem } from '../../engines/engine.types';
 import { instanceKey, instanceLabel } from '../../utils/endpoint.utils';
 import { maskUriCredentials } from '../../utils/uri.utils';
-import { NAME_MAX_LENGTH, NAME_PATTERN } from './create-migration.constants';
+import {
+  DEFAULT_NAME_ALPHABET,
+  DEFAULT_NAME_PREFIX,
+  DEFAULT_NAME_SUFFIX_LENGTH,
+  NAME_MAX_LENGTH,
+  NAME_PATTERN,
+} from './create-migration.constants';
 import { Messages } from './create-migration.messages';
 import type { CreateMigrationDraft, DraftErrors, WizardContext, WizardStep } from './create-migration.types';
+
+/** A random name such as "migration-k3x9a", so users can continue without inventing one. */
+export function generateDefaultName(random: () => number = Math.random): string {
+  const suffix = Array.from(
+    { length: DEFAULT_NAME_SUFFIX_LENGTH },
+    () => DEFAULT_NAME_ALPHABET[Math.floor(random() * DEFAULT_NAME_ALPHABET.length)],
+  ).join('');
+  return `${DEFAULT_NAME_PREFIX}-${suffix}`;
+}
 
 export function createInitialDraft(engines: readonly Engine[]): CreateMigrationDraft {
   const engine = engines.length === 1 ? engines[0] : undefined;
   return {
-    name: '',
+    name: generateDefaultName(),
     engineId: engine?.id ?? '',
     sourceKind: engine && !engine.externalSource ? 'instance' : 'external',
     sourceInstanceKey: '',

@@ -29,12 +29,16 @@ vi.mock('../../api/instances', () => ({ fetchInstances: mocks.fetchInstances }))
 const isDisabled = (element: HTMLElement) => element.hasAttribute('disabled');
 
 describe('CreateMigration wizard', () => {
-  it('blocks Next until the name and the external URI are valid', async () => {
+  it('starts with a valid default name and blocks Next on invalid names and URIs', async () => {
     render(<CreateMigration k8sCluster="main" onNavigate={vi.fn()} />);
 
-    const name = await screen.findByRole('textbox', { name: /name/i });
+    const name = await screen.findByRole<HTMLInputElement>('textbox', { name: /name/i });
     const next = screen.getByRole('button', { name: 'Next' });
     expect(mocks.fetchInstances).toHaveBeenCalledWith('main', expect.any(AbortSignal));
+    expect(name.value).toMatch(/^migration-[a-z0-9]{5}$/);
+    expect(isDisabled(next)).toBe(false);
+
+    fireEvent.change(name, { target: { value: '' } });
     expect(isDisabled(next)).toBe(true);
 
     fireEvent.change(name, { target: { value: 'Orders_DB' } });

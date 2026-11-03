@@ -10,6 +10,7 @@ import {
   createInitialDraft,
   filterSourceInstances,
   filterTargetInstances,
+  generateDefaultName,
   isStepValid,
   validateName,
   withSourceInstance,
@@ -25,6 +26,19 @@ const ENGINES = [pcsmEngine];
 function draft(overrides: Partial<CreateMigrationDraft> = {}): CreateMigrationDraft {
   return { ...createInitialDraft(ENGINES), name: 'orders-into-everest', ...overrides };
 }
+
+describe('generateDefaultName', () => {
+  it('pre-fills the draft with a valid, random migration name', () => {
+    const name = createInitialDraft(ENGINES).name;
+    expect(name).toMatch(/^migration-[a-z0-9]{5}$/);
+    expect(validateName(name)).toBeUndefined();
+  });
+
+  it('maps the full random range onto valid suffix characters', () => {
+    expect(generateDefaultName(() => 0)).toBe('migration-aaaaa');
+    expect(generateDefaultName(() => 0.9999999)).toBe('migration-99999');
+  });
+});
 
 describe('validateName', () => {
   it('accepts Kubernetes-style names up to 40 characters', () => {

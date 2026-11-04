@@ -1,0 +1,27 @@
+# OpenEverest PostgreSQL target (provider-percona-postgresql). PgBouncer is
+# disabled so the connection details point at the primary directly.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: orders-pg
+  namespace: shop
+spec:
+  providerRef:
+    name: provider-percona-postgresql
+  components:
+    engine:
+      type: postgresql
+      replicas: 1
+      resources:
+        requests: {cpu: 200m, memory: 512Mi}
+        limits: {cpu: "1", memory: 1Gi}
+      storage:
+        size: 2Gi
+    proxy:
+      type: pgbouncer
+      replicas: 0

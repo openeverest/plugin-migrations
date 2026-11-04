@@ -354,8 +354,10 @@ func (s *Service) Act(ctx context.Context, token, id string, action Action) (Vie
 	return newView(record, observed), nil
 }
 
-// Delete removes the record and, through ownership, its worker. Target data stays.
-func (s *Service) Delete(ctx context.Context, token, id string) error {
+// Delete removes the record and, through ownership, its worker. Target data
+// stays. Engines that leave state on the source or target (Teardowner) clean
+// it up first; force skips that step, e.g. when the source no longer exists.
+func (s *Service) Delete(ctx context.Context, token, id string, force bool) error {
 	record, err := s.store.Get(ctx, id)
 	if err != nil {
 		return err
@@ -363,12 +365,39 @@ func (s *Service) Delete(ctx context.Context, token, id string) error {
 	if err := s.authorizeMutation(ctx, token, record); err != nil {
 		return hideForbidden(err)
 	}
+	if !force {
+		if err := s.teardown(ctx, record); err != nil {
+			return err
+		}
+	}
 	if err := s.store.Delete(ctx, id); err != nil {
 		return err
 	}
 	s.cacheMu.Lock()
 	delete(s.cache, id)
 	s.cacheMu.Unlock()
+	return nil
+}
+
+// teardown skips migrations that never started: their worker created nothing.
+func (s *Service) teardown(ctx context.Context, record Record) error {
+	if record.StartedAt == nil {
+		return nil
+	}
+	registration, ok := s.registry.Lookup(record.Engine)
+	if !ok {
+		return nil
+	}
+	teardowner, ok := registration.Engine.Controller(s.workloads.BaseURL(record.ID, record.WorkerPort)).(engine.Teardowner)
+	if !ok {
+		return nil
+	}
+	if err := teardowner.Teardown(ctx); err != nil {
+		log.Printf("migration %s: teardown: %v", record.ID, err)
+		return newError(KindUnavailable, fmt.Sprintf(
+			"could not clean up the migration's replication resources (%s); fix the cause and retry, or force the deletion and clean up manually",
+			err.Error()))
+	}
 	return nil
 }
 

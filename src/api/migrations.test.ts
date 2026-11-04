@@ -115,4 +115,10 @@ describe('migrations API', () => {
     await expect(deleteMigration('mig-1')).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledWith('/api/migrations/mig-1', { method: 'DELETE' });
   });
+
+  it('forces a delete with the force query parameter', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    await deleteMigration('mig-1', true);
+    expect(fetchMock).toHaveBeenCalledWith('/api/migrations/mig-1?force=true', { method: 'DELETE' });
+  });
 });

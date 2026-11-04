@@ -34,6 +34,13 @@ type Controller interface {
 	Cutover(ctx context.Context) error
 }
 
+// Teardowner is implemented by controllers whose workers leave state on the
+// source or target (e.g. a PostgreSQL replication slot that retains WAL). The
+// service calls Teardown before deleting a migration; data on the target stays.
+type Teardowner interface {
+	Teardown(ctx context.Context) error
+}
+
 // Descriptor is the public, credential-free description served by /api/status.
 type Descriptor struct {
 	ID                  string   `json:"id"`

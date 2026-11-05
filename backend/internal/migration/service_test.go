@@ -157,9 +157,23 @@ func (c *fakeController) Pause(context.Context) error   { return c.record("pause
 func (c *fakeController) Resume(context.Context) error  { return c.record("resume") }
 func (c *fakeController) Cutover(context.Context) error { return c.record("cutover") }
 
+// teardownController is a controller whose engine leaves state behind.
+type teardownController struct {
+	*fakeController
+	err   error
+	calls int
+}
+
+func (c *teardownController) Teardown(context.Context) error {
+	c.calls++
+	return c.err
+}
+
 type fakeEngine struct {
 	controller *fakeController
 	prepareErr error
+	// teardown, when set, makes the controller an engine.Teardowner.
+	teardown *teardownController
 }
 
 func (e *fakeEngine) ID() string { return "fake" }
@@ -179,7 +193,12 @@ func (e *fakeEngine) Prepare(input engine.PrepareInput) (engine.Prepared, error)
 		SourceDisplay: "db1:27017",
 	}, nil
 }
-func (e *fakeEngine) Controller(string) engine.Controller { return e.controller }
+func (e *fakeEngine) Controller(string) engine.Controller {
+	if e.teardown != nil {
+		return e.teardown
+	}
+	return e.controller
+}
 
 type harness struct {
 	service    *Service
@@ -312,7 +331,7 @@ func TestCreateRejectsTargetUntilPreviousMigrationIsGone(t *testing.T) {
 	if _, err := h.service.Create(ctx, "jwt", second); KindOf(err) != KindConflict {
 		t.Fatalf("completed migration: error = %v", err)
 	}
-	if err := h.service.Delete(ctx, "jwt", first.ID); err != nil {
+	if err := h.service.Delete(ctx, "jwt", first.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	h.workloads.targetBusy = true
@@ -479,15 +498,54 @@ func TestActAndDeleteRequireReadConnection(t *testing.T) {
 	if _, err := h.service.Act(ctx, "jwt", "mig-1", ActionPause); KindOf(err) != KindNotFound {
 		t.Fatalf("act error = %v", err)
 	}
-	if err := h.service.Delete(ctx, "jwt", "mig-1"); KindOf(err) != KindNotFound {
+	if err := h.service.Delete(ctx, "jwt", "mig-1", false); KindOf(err) != KindNotFound {
 		t.Fatalf("delete error = %v", err)
 	}
 	delete(h.everest.denied, "shop/orders")
-	if err := h.service.Delete(ctx, "jwt", "mig-1"); err != nil {
+	if err := h.service.Delete(ctx, "jwt", "mig-1", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.store.Get(ctx, "mig-1"); KindOf(err) != KindNotFound {
 		t.Fatal("record not deleted")
+	}
+}
+
+func TestDeleteTearsDownEngineStateUnlessForced(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.service.Create(ctx, "jwt", externalRequest()); err != nil {
+		t.Fatal(err)
+	}
+	h.engine.teardown = &teardownController{fakeController: h.controller, err: errors.New("source unreachable")}
+	if err := h.service.Delete(ctx, "jwt", "mig-1", false); err != nil || h.engine.teardown.calls != 0 {
+		t.Fatalf("a migration that never started has nothing to tear down: %v, calls = %d", err, h.engine.teardown.calls)
+	}
+	if _, err := h.service.Create(ctx, "jwt", externalRequest()); err != nil {
+		t.Fatal(err)
+	}
+	h.service.Reconcile(ctx)
+
+	err := h.service.Delete(ctx, "jwt", "mig-2", false)
+	if KindOf(err) != KindUnavailable || !strings.Contains(err.Error(), "source unreachable") {
+		t.Fatalf("failed teardown must block the deletion: %v", err)
+	}
+	if _, err := h.store.Get(ctx, "mig-2"); err != nil {
+		t.Fatal("the record must survive a failed teardown so the deletion can be retried")
+	}
+	if err := h.service.Delete(ctx, "jwt", "mig-2", true); err != nil {
+		t.Fatalf("forced deletion: %v", err)
+	}
+	if h.engine.teardown.calls != 1 {
+		t.Fatalf("forced deletion must skip the teardown; calls = %d", h.engine.teardown.calls)
+	}
+
+	if _, err := h.service.Create(ctx, "jwt", externalRequest()); err != nil {
+		t.Fatal(err)
+	}
+	h.service.Reconcile(ctx)
+	h.engine.teardown.err = nil
+	if err := h.service.Delete(ctx, "jwt", "mig-3", false); err != nil || h.engine.teardown.calls != 2 {
+		t.Fatalf("delete after a successful teardown: %v, calls = %d", err, h.engine.teardown.calls)
 	}
 }
 

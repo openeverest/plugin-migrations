@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   defaultPcsmOptions,
   isPcsmOptionsDraft,
-  splitNamespaceInput,
   summarizePcsmOptions,
   toPcsmRequestOptions,
   validateMongoUri,
@@ -112,12 +111,6 @@ describe('isPcsmOptionsDraft', () => {
     expect(isPcsmOptionsDraft(defaultPcsmOptions())).toBe(true);
     expect(isPcsmOptionsDraft({ includeNamespaces: [], excludeNamespaces: [], pauseOnInitialSync: false })).toBe(false);
     expect(isPcsmOptionsDraft({ ...defaultPcsmOptions(), includeNamespaces: [1] })).toBe(false);
-  });
-});
-
-describe('splitNamespaceInput', () => {
-  it('splits pasted lists and drops duplicates', () => {
-    expect(splitNamespaceInput(['shop.*', 'a, b.c  d', 'shop.*'])).toEqual(['shop.*', 'a', 'b.c', 'd']);
   });
 });
 

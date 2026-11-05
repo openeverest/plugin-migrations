@@ -58,6 +58,32 @@ jobs:
         run: cd backend && go build -o /dev/null .
 
   # ──────────────────────────────────────────────────────────────────────────
+  # postgres-logical worker agent: vet + test + image build
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres-logical-worker:
+    name: postgres-logical worker (gofmt + vet + test + image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Vet
+        run: cd workers/postgres-logical && go vet ./...
+
+      - name: Format
+        run: test -z "$(cd workers/postgres-logical && gofmt -l .)"
+
+      - name: Test
+        run: cd workers/postgres-logical && go test -race ./...
+
+      - name: Build image
+        run: docker build -t plugin-migrations-postgres-logical:ci workers/postgres-logical
+
+  # ──────────────────────────────────────────────────────────────────────────
   # Helm: lint
   # ──────────────────────────────────────────────────────────────────────────
   helm-lint:

@@ -34,6 +34,9 @@ export function cutoverMigration(id: string): Promise<Migration> {
   return runWorkerAction(id, 'cutover');
 }
 
-export function deleteMigration(id: string): Promise<void> {
-  return apiFetchNoContent(migrationPath(id), { method: 'DELETE' });
+// force skips the engine's cleanup of replication resources (e.g. when the
+// source no longer exists); the user then cleans them up manually.
+export function deleteMigration(id: string, force = false): Promise<void> {
+  const query = force ? '?force=true' : '';
+  return apiFetchNoContent(`${migrationPath(id)}${query}`, { method: 'DELETE' });
 }

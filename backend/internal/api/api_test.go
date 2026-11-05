@@ -21,6 +21,7 @@ type stubService struct {
 	lastID    string
 	action    migration.Action
 	created   migration.CreateRequest
+	lastForce bool
 }
 
 func (s *stubService) Engines() []engine.Descriptor {
@@ -42,8 +43,8 @@ func (s *stubService) Act(_ context.Context, token, id string, action migration.
 	s.lastToken, s.lastID, s.action = token, id, action
 	return migration.View{ID: id}, s.err
 }
-func (s *stubService) Delete(_ context.Context, token, id string) error {
-	s.lastToken, s.lastID = token, id
+func (s *stubService) Delete(_ context.Context, token, id string, force bool) error {
+	s.lastToken, s.lastID, s.lastForce = token, id, force
 	return s.err
 }
 
@@ -167,8 +168,11 @@ func TestMigrationActions(t *testing.T) {
 	if recorder := serve(service, http.MethodPost, "/api/migrations/mig-7/delete", "", bearer); recorder.Code != http.StatusNotFound {
 		t.Fatalf("delete must use DELETE, got %d", recorder.Code)
 	}
-	if recorder := serve(service, http.MethodDelete, "/api/migrations/mig-7", "", bearer); recorder.Code != http.StatusNoContent {
-		t.Fatalf("delete = %d", recorder.Code)
+	if recorder := serve(service, http.MethodDelete, "/api/migrations/mig-7", "", bearer); recorder.Code != http.StatusNoContent || service.lastForce {
+		t.Fatalf("delete = %d force=%v", recorder.Code, service.lastForce)
+	}
+	if recorder := serve(service, http.MethodDelete, "/api/migrations/mig-7?force=true", "", bearer); recorder.Code != http.StatusNoContent || !service.lastForce {
+		t.Fatalf("forced delete = %d force=%v", recorder.Code, service.lastForce)
 	}
 }
 

@@ -100,8 +100,10 @@ export const MigrationDetails = ({ id, onNavigate }: MigrationDetailsProps) => {
         busy={actions.pending === 'delete'}
         migrationName={migration.name}
         active={migration.phase !== 'completed' && migration.phase !== 'failed'}
+        error={actions.deleteError}
         onCancel={actions.closeDialog}
         onConfirm={() => void actions.run('delete')}
+        onForce={actions.forceDelete}
       />
     </Stack>
   );

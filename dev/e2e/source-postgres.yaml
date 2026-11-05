@@ -1,0 +1,52 @@
+# Stand-in for an external PostgreSQL: logical decoding enabled, data in an
+# emptyDir. The postgres superuser has the REPLICATION attribute logical replication needs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legacy
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: source-pg
+  namespace: legacy
+stringData:
+  POSTGRES_PASSWORD: source-secret-pw
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: source-pg
+  namespace: legacy
+spec:
+  clusterIP: None
+  selector: {app: source-pg}
+  ports: [{name: pg, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: source-pg
+  namespace: legacy
+spec:
+  serviceName: source-pg
+  replicas: 1
+  selector: {matchLabels: {app: source-pg}}
+  template:
+    metadata: {labels: {app: source-pg}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          args: ["-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10", "-c", "shared_buffers=128MB"]
+          envFrom: [{secretRef: {name: source-pg}}]
+          env: [{name: PGDATA, value: /var/lib/postgresql/data/pgdata}]
+          ports: [{containerPort: 5432}]
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "postgres"]}
+            periodSeconds: 5
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes: [{name: data, emptyDir: {}}]

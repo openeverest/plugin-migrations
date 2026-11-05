@@ -1,6 +1,6 @@
 # plugin-migrations — Architecture
 
-> Status: **Draft v0.1** · Last updated: 2026-11-03
+> Status: **Draft v0.1** · Last updated: 2026-11-04
 
 `plugin-migrations` is an OpenEverest generic plugin that moves data **into**
 OpenEverest-managed databases with minimal downtime. It works like
@@ -11,10 +11,11 @@ application is ready to switch.
 
 The plugin is **modular**. Every database technology is an **engine** that
 plugs into a shared lifecycle, storage, API and UI, the same way
-plugin-bench adds benchmark drivers. The first engine is **MongoDB → MongoDB**
+plugin-bench adds benchmark drivers. The engines are **MongoDB → MongoDB**
 built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-(PCSM).
+(PCSM), and **PostgreSQL → PostgreSQL** built on native logical replication
+(`postgres-logical`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -22,8 +23,8 @@ built on
 
 - A sidebar entry (**Migrations**) listing migrations, creating new ones, and
   showing a migration's progress and actions. The plugin has no cluster tab yet.
-- Source: an **external MongoDB URI** or an **OpenEverest instance**. Target: an
-  **OpenEverest instance**.
+- Source: an **external URI** or an **OpenEverest instance**. Target: an
+  **OpenEverest instance** of the same database type.
 - Full load + CDC with explicit **pause / resume / cutover / delete**.
 - Migrations survive plugin backend restarts and upgrades without an external
   database.
@@ -70,6 +71,7 @@ Backend layers (Go, `backend/internal/...`):
 | --- | --- | --- |
 | `engine` | Technology-agnostic contracts: `Engine`, `Controller`, `WorkerSpec`, `Status`, `Phase`; engine registry. | Nothing else |
 | `engine/pcsm` | MongoDB engine: option validation, worker spec (image, env, secrets), PCSM HTTP client, and mapping PCSM state to `engine.Status`. | `engine` |
+| `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), client for the agent in `workers/postgres-logical`, teardown. | `engine` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
 | `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
@@ -99,6 +101,12 @@ type Controller interface {
     Pause(ctx) error
     Resume(ctx) error                               // engine decides how to resume (e.g. PCSM fromFailure)
     Cutover(ctx) error                              // PCSM: /finalize
+}
+
+// engine.Teardowner: optional, implemented by controllers whose workers leave
+// state behind (a PostgreSQL replication slot keeps WAL on the source).
+type Teardowner interface {
+    Teardown(ctx) error                             // remove it; data on the target stays
 }
 ```
 
@@ -154,6 +162,22 @@ PCSM mapping:
 | `finalizing` | `finalizing` |
 | `finalized` | `completed` |
 | `failed` | `failed` |
+
+`postgres-logical` mapping (the agent's `/status`):
+
+| Agent state | Phase |
+| --- | --- |
+| `idle` | `starting` |
+| `running`, not every table in subscription state `r` (ready) | `full-load` (schema copy, then table sync) |
+| `running`, tables ready, heartbeat lag above 15s | `catching-up` |
+| `running`, tables ready, lag ≤ 15s once | `replicating` (ready for cutover) |
+| `paused` (subscription disabled) | `paused` |
+| `finalizing` | `finalizing` |
+| `completed` | `completed` |
+| `failed` | `failed` |
+
+Lag is the source's `now()` minus the last heartbeat replicated to the target,
+so it uses only the source clock.
 
 ### Allowed actions
 
@@ -224,8 +248,13 @@ it later (for GitOps) without changing the domain service.
    `startedAt`. The migration therefore starts even when the browser is closed.
 3. **Act** (`pause`/`resume`/`cutover`): check the caller's access, check the
    action is allowed for the live phase, then call the controller.
-4. **Delete**: delete the ConfigMap. The worker stops and data already written
-   to the target is kept.
+4. **Delete**: if the engine's controller is a `Teardowner` and the migration
+   was started, call `Teardown` first (PostgreSQL: drop the subscription, the
+   source slot and publication, and the heartbeat tables). A failed teardown
+   returns 502 and keeps the record, so nothing is left retaining WAL
+   silently; `?force=true` skips it when the source no longer exists. Then
+   delete the ConfigMap. The worker stops and data already written to the
+   target is kept.
 
 ## 7. Security
 
@@ -309,7 +338,9 @@ allowed in the current phase.
 
 ### `DELETE /api/migrations/{id}`
 
-`204`. Stops and removes the worker. Data on the target is kept.
+`204`. Cleans up the engine's replication state (see §6), then stops and
+removes the worker. Data on the target is kept. `?force=true` skips the
+cleanup; the UI offers it as **Delete anyway** after a failed delete.
 
 ### `Migration`
 
@@ -356,6 +387,20 @@ unknown. `source.display` is set only for external sources.
 | `clone.numInsertWorkers` | `int` (1–256) | PCSM default | `cloneNumInsertWorkers` |
 | `replication.numWorkers` | `int` (1–256) | PCSM default | `replNumWorkers` |
 
+### PostgreSQL engine options (`engine: "postgres-logical"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `database` | `string` | database in the source URI | Required for instance sources. The target database gets the same name. |
+| `includeSchemas` | `string[]` | `[]` (all) | Schemas to migrate. |
+| `excludeSchemas` | `string[]` | `[]` | `openeverest_migration` is reserved. |
+| `excludeTables` | `string[]` (`schema.table`) | `[]` | |
+| `recreateDatabase` | `bool` | `false` | Drop and recreate the target database if it exists. Otherwise an existing database fails the migration. |
+
+Only `provider-percona-postgresql` targets are offered, because `CREATE
+SUBSCRIPTION` needs the superuser that its connection details provide. The
+source and target must be different servers.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -381,6 +426,9 @@ unknown. `source.display` is set only for external sources.
 
 - `engines.pcsm.enabled` and `engines.pcsm.image`
   (`percona/percona-clustersync-mongodb:1.0.0`).
+- `engines.postgres-logical.enabled` and `engines.postgres-logical.image`
+  (`ghcr.io/openeverest/plugin-migrations-postgres-logical`, released with
+  the plugin).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
@@ -408,6 +456,15 @@ unknown. `source.display` is set only for external sources.
    completed migration's worker keeps running until its record is deleted, so
    the backend rejects a new migration while the target has any migration
    record or a worker pod that is still shutting down.
+6. **PostgreSQL WAL retention.** The source slot retains WAL while a migration
+   runs or is paused. Delete tears it down; a forced delete leaves it for the
+   user. A status warning or a `max_slot_wal_keep_size` check would help.
+7. **PostgreSQL reachability.** The subscription connects from the **target
+   instance's** pods, not from the worker. A worker-only connectivity check
+   does not prove the target can reach the source.
+8. **PostgreSQL schema changes.** DDL is not replicated; the user must freeze
+   it until cutover. Operator-managed schemas (`pgbouncer`) differ between
+   providers and are excluded by a fixed list.
 
 ## 12. Roadmap
 
@@ -416,6 +473,10 @@ unknown. `source.display` is set only for external sources.
   `clusterDetailTab` on target instances.
 - v0.3: HA workers (2 replicas, PCSM lease), post-cutover validation (counts and
   sample hashes), PCSM state cleanup on delete.
-- Next engines: PostgreSQL (logical replication / pgcopydb), MySQL (Percona
-  XtraBackup + replication, or a binlog-based CDC tool).
+- PostgreSQL: a physical-standby engine (`pg_basebackup` + streaming
+  replication, promote at cutover) for whole-cluster migrations with DDL. It
+  needs provider support to create an instance as a standby and promote it.
+  `pgcopydb` was evaluated and set aside until its CDC fixes are released.
+- Next engines: MySQL (Percona XtraBackup + replication, or a binlog-based CDC
+  tool).
 - Optional Migration CRD and controller for GitOps.

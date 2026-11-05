@@ -20,6 +20,8 @@ export function useMigrationActions(id: string, { onUpdated, onDeleted }: Migrat
   const [pending, setPending] = useState<MigrationAction>();
   const [error, setError] = useState<string>();
   const [dialog, setDialog] = useState<ConfirmDialog>();
+  // Delete errors stay in the open dialog so the user can retry or force it.
+  const [deleteError, setDeleteError] = useState<string>();
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -31,19 +33,35 @@ export function useMigrationActions(id: string, { onUpdated, onDeleted }: Migrat
 
   useEffect(() => {
     setError(undefined);
+    setDeleteError(undefined);
     setDialog(undefined);
   }, [id]);
 
+  const remove = useCallback(
+    async (force: boolean) => {
+      setPending('delete');
+      setDeleteError(undefined);
+      try {
+        await deleteMigration(id, force);
+        if (mounted.current) onDeleted();
+      } catch (err) {
+        if (mounted.current) setDeleteError(errorMessage(err));
+      } finally {
+        if (mounted.current) setPending(undefined);
+      }
+    },
+    [id, onDeleted],
+  );
+
   const run = useCallback(
     async (action: MigrationAction) => {
+      if (action === 'delete') {
+        await remove(false);
+        return;
+      }
       setPending(action);
       setError(undefined);
       try {
-        if (action === 'delete') {
-          await deleteMigration(id);
-          if (mounted.current) onDeleted();
-          return;
-        }
         const updated = await WORKER_ACTION_HANDLERS[action](id);
         if (!mounted.current) return;
         onUpdated(updated);
@@ -56,8 +74,10 @@ export function useMigrationActions(id: string, { onUpdated, onDeleted }: Migrat
         if (mounted.current) setPending(undefined);
       }
     },
-    [id, onDeleted, onUpdated],
+    [id, onUpdated, remove],
   );
+
+  const forceDelete = useCallback(() => void remove(true), [remove]);
 
   // Cutover and delete are confirmed in a dialog first; pause/resume run directly.
   const request = useCallback(
@@ -68,7 +88,10 @@ export function useMigrationActions(id: string, { onUpdated, onDeleted }: Migrat
     [run],
   );
 
-  const closeDialog = useCallback(() => setDialog(undefined), []);
+  const closeDialog = useCallback(() => {
+    setDialog(undefined);
+    setDeleteError(undefined);
+  }, []);
 
-  return { pending, error, dialog, request, run, closeDialog };
+  return { pending, error, deleteError, dialog, request, run, forceDelete, closeDialog };
 }

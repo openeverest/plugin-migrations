@@ -64,6 +64,9 @@ export const Messages = {
       `Deleting "${name}" stops and removes its worker. Data already copied to the target is kept.`,
     activeWarning: 'The migration has not completed. Replication stops immediately and the target may be incomplete.',
     confirm: 'Delete',
+    forceConfirm: 'Delete anyway',
+    forceHint:
+      'Delete anyway removes the migration without that cleanup. Remove what it left behind yourself: for PostgreSQL, drop the replication slot and publication on the source, or the source keeps retaining WAL.',
     cancel: 'Cancel',
   },
 };

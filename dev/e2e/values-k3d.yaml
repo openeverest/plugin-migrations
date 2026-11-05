@@ -11,3 +11,9 @@ worker:
       memory: 256Mi
     limits:
       memory: 1Gi
+engines:
+  postgres-logical:
+    image:
+      repository: plugin-migrations-postgres-logical
+      tag: e2e
+      pullPolicy: Never

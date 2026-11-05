@@ -1,9 +1,9 @@
 import { FormControlLabel, FormHelperText, Stack, Switch } from '@mui/material';
+import { ChipListInput } from '../../components/chip-list-input/chip-list-input';
 import type { EngineOptionsFormProps } from '../engine.types';
-import { NamespaceListInput } from './namespace-list-input/namespace-list-input';
 import { Messages } from './pcsm.messages';
 import type { PcsmOptionsDraft } from './pcsm.types';
-import { updateTuning, validatePcsmOptions } from './pcsm.utils';
+import { isValidNamespace, updateTuning, validatePcsmOptions } from './pcsm.utils';
 import { TuningOptions } from './tuning-options/tuning-options';
 
 export const PcsmOptionsForm = ({ value, onChange, disabled }: EngineOptionsFormProps<PcsmOptionsDraft>) => {
@@ -11,18 +11,20 @@ export const PcsmOptionsForm = ({ value, onChange, disabled }: EngineOptionsForm
 
   return (
     <Stack spacing={3}>
-      <NamespaceListInput
+      <ChipListInput
         label={Messages.includeNamespaces.label}
         helperText={Messages.includeNamespaces.helper}
         value={value.includeNamespaces}
+        isValidItem={isValidNamespace}
         error={errors.includeNamespaces}
         disabled={disabled}
         onChange={(includeNamespaces) => onChange({ ...value, includeNamespaces })}
       />
-      <NamespaceListInput
+      <ChipListInput
         label={Messages.excludeNamespaces.label}
         helperText={Messages.excludeNamespaces.helper}
         value={value.excludeNamespaces}
+        isValidItem={isValidNamespace}
         error={errors.excludeNamespaces}
         disabled={disabled}
         onChange={(excludeNamespaces) => onChange({ ...value, excludeNamespaces })}

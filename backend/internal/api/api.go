@@ -23,7 +23,7 @@ type MigrationService interface {
 	List(ctx context.Context, token string) ([]migration.View, error)
 	Get(ctx context.Context, token, id string) (migration.View, error)
 	Act(ctx context.Context, token, id string, action migration.Action) (migration.View, error)
-	Delete(ctx context.Context, token, id string) error
+	Delete(ctx context.Context, token, id string, force bool) error
 }
 
 type InstanceLister interface {
@@ -125,7 +125,8 @@ func (a *API) handleGetMigration(w http.ResponseWriter, r *http.Request, token s
 }
 
 func (a *API) handleDeleteMigration(w http.ResponseWriter, r *http.Request, token string) {
-	if err := a.migrations.Delete(r.Context(), token, r.PathValue("id")); err != nil {
+	force := r.URL.Query().Get("force") == "true"
+	if err := a.migrations.Delete(r.Context(), token, r.PathValue("id"), force); err != nil {
 		writeServiceError(w, err)
 		return
 	}

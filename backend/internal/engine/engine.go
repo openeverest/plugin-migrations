@@ -152,12 +152,27 @@ type WorkerSpec struct {
 	// runs again on worker restarts, so it may discard state a previous
 	// migration left on the target.
 	Bootstrap *Command
+	// Volume, when set, gives the worker a persistent volume of its own. It
+	// is created with the migration, survives worker restarts and is deleted
+	// with the migration.
+	Volume *Volume
 }
 
 // Command overrides a container's entrypoint (Command) and arguments.
 type Command struct {
 	Command []string
 	Args    []string
+}
+
+// Volume is a worker's persistent volume.
+type Volume struct {
+	// SizeGiB is the requested capacity in GiB.
+	SizeGiB int
+	// MountPath is where the volume is mounted in the worker.
+	MountPath string
+	// FSGroup owns the volume's files, so the image's non-root user can
+	// write to it.
+	FSGroup int64
 }
 
 // SecretMountPath is where SecretFiles are mounted inside the worker.
@@ -200,6 +215,19 @@ func (s WorkerSpec) Validate() error {
 	if s.Bootstrap != nil && len(s.Bootstrap.Command) == 0 && len(s.Bootstrap.Args) == 0 {
 		return errors.New("worker bootstrap must set a command or arguments")
 	}
+	if v := s.Volume; v != nil {
+		switch {
+		case v.SizeGiB <= 0:
+			return errors.New("worker volume size must be positive")
+		case !strings.HasPrefix(v.MountPath, "/") || v.MountPath == "/":
+			return errors.New("worker volume mount path must be an absolute directory")
+		case v.MountPath == SecretMountPath || strings.HasPrefix(SecretMountPath, strings.TrimSuffix(v.MountPath, "/")+"/") ||
+			strings.HasPrefix(v.MountPath, SecretMountPath+"/"):
+			return errors.New("worker volume mount path must not overlap the secrets mount")
+		case v.FSGroup <= 0:
+			return errors.New("worker volume fsGroup must be a non-root group")
+		}
+	}
 	return nil
 }
 
@@ -215,6 +243,10 @@ func (s WorkerSpec) Clone() WorkerSpec {
 	}
 	if s.Bootstrap != nil {
 		clone.Bootstrap = &Command{Command: slices.Clone(s.Bootstrap.Command), Args: slices.Clone(s.Bootstrap.Args)}
+	}
+	if s.Volume != nil {
+		volume := *s.Volume
+		clone.Volume = &volume
 	}
 	return clone
 }

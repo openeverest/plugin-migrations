@@ -121,3 +121,6 @@ worker:
   nodeSelector: {}
   tolerations: []
   imagePullSecrets: []
+  # Storage class of the volumes some workers keep data on (tidb-dm: the
+  # dump and DM's state). Empty uses the cluster's default class.
+  storageClassName: ""

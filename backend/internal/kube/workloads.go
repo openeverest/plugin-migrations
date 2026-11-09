@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -26,6 +27,7 @@ const (
 	workerContainer    = "worker"
 	bootstrapContainer = "bootstrap"
 	secretsVolumeName  = "endpoint-secrets"
+	dataVolumeName     = "data"
 	bootstrapSuffix    = "-bootstrap"
 )
 
@@ -35,10 +37,13 @@ type WorkerConfig struct {
 	NodeSelector     map[string]string
 	Tolerations      []corev1.Toleration
 	ImagePullSecrets []corev1.LocalObjectReference
+	// StorageClassName is used for worker volumes; empty uses the cluster
+	// default.
+	StorageClassName string
 }
 
-// Workloads runs one Deployment + Service + Secret (+ optional bootstrap Job)
-// per migration, all owned by the migration's ConfigMap.
+// Workloads runs one Deployment + Service + Secret (+ optional bootstrap Job
+// and volume) per migration, all owned by the migration's ConfigMap.
 type Workloads struct {
 	client    kubernetes.Interface
 	namespace string
@@ -103,6 +108,11 @@ func (w *Workloads) Apply(ctx context.Context, record migration.Record, worker e
 	if _, err := w.client.CoreV1().Services(w.namespace).Create(ctx, service, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create worker service: %w", err)
 	}
+	if worker.Volume != nil {
+		if _, err := w.client.CoreV1().PersistentVolumeClaims(w.namespace).Create(ctx, w.volumeClaim(meta, *worker.Volume), metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("create worker volume: %w", err)
+		}
+	}
 
 	replicas := int32(1)
 	if worker.Bootstrap != nil {
@@ -120,6 +130,24 @@ func (w *Workloads) Apply(ctx context.Context, record migration.Record, worker e
 	return nil
 }
 
+// volumeClaim is the worker's volume. Kubernetes keeps it until the pods
+// using it are gone, then garbage-collects it with the record.
+func (w *Workloads) volumeClaim(meta metav1.ObjectMeta, volume engine.Volume) *corev1.PersistentVolumeClaim {
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: meta,
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceStorage: *resource.NewQuantity(int64(volume.SizeGiB)<<30, resource.BinarySI),
+			}},
+		},
+	}
+	if w.config.StorageClassName != "" {
+		claim.Spec.StorageClassName = ptr.To(w.config.StorageClassName)
+	}
+	return claim
+}
+
 // container builds the container shared by the Deployment and the bootstrap
 // Job: same image, env, secrets and hardening.
 func (w *Workloads) container(record migration.Record, name string, worker engine.WorkerSpec) corev1.Container {
@@ -135,6 +163,9 @@ func (w *Workloads) container(record migration.Record, name string, worker engin
 	var mounts []corev1.VolumeMount
 	if len(worker.SecretFiles) > 0 {
 		mounts = append(mounts, corev1.VolumeMount{Name: secretsVolumeName, MountPath: engine.SecretMountPath, ReadOnly: true})
+	}
+	if worker.Volume != nil {
+		mounts = append(mounts, corev1.VolumeMount{Name: dataVolumeName, MountPath: worker.Volume.MountPath})
 	}
 	return corev1.Container{
 		Name:            name,
@@ -164,18 +195,26 @@ func (w *Workloads) podSpec(record migration.Record, worker engine.WorkerSpec, c
 			Secret: &corev1.SecretVolumeSource{SecretName: record.ID, Items: items, DefaultMode: ptr.To[int32](0o444)},
 		}})
 	}
+	securityContext := &corev1.PodSecurityContext{
+		RunAsNonRoot:   ptr.To(true),
+		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+	if worker.Volume != nil {
+		volumes = append(volumes, corev1.Volume{Name: dataVolumeName, VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: record.ID},
+		}})
+		securityContext.FSGroup = ptr.To(worker.Volume.FSGroup)
+		securityContext.FSGroupChangePolicy = ptr.To(corev1.FSGroupChangeOnRootMismatch)
+	}
 	return corev1.PodSpec{
 		AutomountServiceAccountToken: ptr.To(false),
 		EnableServiceLinks:           ptr.To(false),
 		NodeSelector:                 maps.Clone(w.config.NodeSelector),
 		Tolerations:                  slices.Clone(w.config.Tolerations),
 		ImagePullSecrets:             slices.Clone(w.config.ImagePullSecrets),
-		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot:   ptr.To(true),
-			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-		},
-		Volumes:    volumes,
-		Containers: []corev1.Container{container},
+		SecurityContext:              securityContext,
+		Volumes:                      volumes,
+		Containers:                   []corev1.Container{container},
 	}
 }
 

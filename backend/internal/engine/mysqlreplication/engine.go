@@ -16,6 +16,7 @@ import (
 
 	"github.com/openeverest/plugin-migrations/backend/internal/engine"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/agentclient"
+	"github.com/openeverest/plugin-migrations/backend/internal/engine/mysqluri"
 )
 
 const (
@@ -139,19 +140,19 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 		}
 		env["TARGET_SKIP_REPLICA_START"] = "true"
 	}
-	source, err := parseMySQLURI(sourceConn.URI, sourceConn, e.variant.schemes)
+	source, err := mysqluri.Parse(sourceConn.URI, sourceConn, e.variant.schemes)
 	if err != nil {
 		return engine.Prepared{}, invalidRequest("source connection string %v", err)
 	}
-	target, err := parseMySQLURI(targetConn.URI, targetConn, e.variant.schemes)
+	target, err := mysqluri.Parse(targetConn.URI, targetConn, e.variant.schemes)
 	if err != nil {
 		return engine.Prepared{}, invalidRequest("target connection string %v", err)
 	}
-	if len(options.Databases) == 0 && input.Source.Provider == "" && source.database != "" {
-		if err := validateName("databases", source.database, false); err != nil {
+	if len(options.Databases) == 0 && input.Source.Provider == "" && source.Database != "" {
+		if err := validateName("databases", source.Database, false); err != nil {
 			return engine.Prepared{}, err
 		}
-		options.Databases = []string{source.database}
+		options.Databases = []string{source.Database}
 	}
 	if len(options.Databases) == 0 {
 		return engine.Prepared{}, invalidRequest("choose the databases to migrate")
@@ -159,7 +160,7 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 	if err := options.validateTables(); err != nil {
 		return engine.Prepared{}, err
 	}
-	if source.endpoint() == target.endpoint() {
+	if source.Endpoint() == target.Endpoint() {
 		return engine.Prepared{}, invalidRequest("source and target must be different %s servers", e.variant.product)
 	}
 	snapshot, err := json.Marshal(options)
@@ -177,11 +178,11 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 		SecretEnv:       map[string]string{"SOURCE_URI": secretKeySourceURI, "TARGET_URI": secretKeyTargetURI},
 		SecretFiles:     map[string]string{},
 	}
-	sourceURI, err := source.workerURI(mountCA(sourceConn.CACert, secretKeySourceCA, &worker))
+	sourceURI, err := source.WorkerURI(mysqluri.MountCA(sourceConn.CACert, secretKeySourceCA, &worker))
 	if err != nil {
 		return engine.Prepared{}, invalidRequest("source connection string %v", err)
 	}
-	targetURI, err := target.workerURI(mountCA(targetConn.CACert, secretKeyTargetCA, &worker))
+	targetURI, err := target.WorkerURI(mysqluri.MountCA(targetConn.CACert, secretKeyTargetCA, &worker))
 	if err != nil {
 		return engine.Prepared{}, invalidRequest("target connection string %v", err)
 	}
@@ -191,18 +192,7 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 	if err := worker.Validate(); err != nil {
 		return engine.Prepared{}, fmt.Errorf("invalid migration worker: %w", err)
 	}
-	return engine.Prepared{Worker: worker, Snapshot: snapshot, SourceDisplay: source.endpoint()}, nil
-}
-
-// mountCA adds a CA to the worker's secret files and returns its path, or ""
-// without a CA.
-func mountCA(caCert, key string, worker *engine.WorkerSpec) string {
-	if caCert == "" {
-		return ""
-	}
-	worker.SecretData[key] = []byte(caCert)
-	worker.SecretFiles[key] = key
-	return engine.SecretMountPath + "/" + key
+	return engine.Prepared{Worker: worker, Snapshot: snapshot, SourceDisplay: source.Endpoint()}, nil
 }
 
 // channelName names the replication channel and the heartbeat row, unique

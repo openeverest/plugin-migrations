@@ -108,6 +108,7 @@ func workerConfigFromEnv() (kube.WorkerConfig, error) {
 			return kube.WorkerConfig{}, err
 		}
 	}
+	config.StorageClassName = strings.TrimSpace(os.Getenv("WORKER_STORAGE_CLASS_NAME"))
 	return config, nil
 }
 

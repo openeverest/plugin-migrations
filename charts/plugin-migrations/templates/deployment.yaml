@@ -58,6 +58,8 @@ spec:
               value: {{ .Values.worker.tolerations | toJson | quote }}
             - name: WORKER_IMAGE_PULL_SECRETS
               value: {{ .Values.worker.imagePullSecrets | toJson | quote }}
+            - name: WORKER_STORAGE_CLASS_NAME
+              value: {{ .Values.worker.storageClassName | default "" | quote }}
             {{- if .Values.everestAPIURL }}
             - name: EVEREST_API_URL
               value: {{ .Values.everestAPIURL | quote }}

@@ -61,6 +61,7 @@ func TestWorkerSpecValidate(t *testing.T) {
 		SecretData:  map[string][]byte{"uri": []byte("x"), "ca": []byte("y")},
 		SecretEnv:   map[string]string{"URI": "uri"},
 		SecretFiles: map[string]string{"ca": "ca.crt"},
+		Volume:      &Volume{SizeGiB: 10, MountPath: "/data", FSGroup: 65532},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
@@ -73,6 +74,12 @@ func TestWorkerSpecValidate(t *testing.T) {
 		"dangling env ref":   func(s *WorkerSpec) { s.SecretEnv["X"] = "missing" },
 		"dangling file ref":  func(s *WorkerSpec) { s.SecretFiles["missing"] = "f" },
 		"path in file name":  func(s *WorkerSpec) { s.SecretFiles["ca"] = "../ca.crt" },
+		"empty volume":       func(s *WorkerSpec) { s.Volume.SizeGiB = 0 },
+		"relative volume":    func(s *WorkerSpec) { s.Volume.MountPath = "data" },
+		"volume on root":     func(s *WorkerSpec) { s.Volume.MountPath = "/" },
+		"volume over secret": func(s *WorkerSpec) { s.Volume.MountPath = "/etc/migration" },
+		"volume in secret":   func(s *WorkerSpec) { s.Volume.MountPath = SecretMountPath + "/data" },
+		"volume root group":  func(s *WorkerSpec) { s.Volume.FSGroup = 0 },
 	}
 	for name, mutate := range mutations {
 		spec := valid.Clone()
@@ -84,11 +91,12 @@ func TestWorkerSpecValidate(t *testing.T) {
 }
 
 func TestWorkerSpecCloneIsDeep(t *testing.T) {
-	original := WorkerSpec{SecretData: map[string][]byte{"k": []byte("secret")}, Env: map[string]string{"A": "1"}}
+	original := WorkerSpec{SecretData: map[string][]byte{"k": []byte("secret")}, Env: map[string]string{"A": "1"}, Volume: &Volume{SizeGiB: 1}}
 	clone := original.Clone()
 	clone.SecretData["k"][0] = 'X'
 	clone.Env["A"] = "2"
-	if string(original.SecretData["k"]) != "secret" || original.Env["A"] != "1" {
+	clone.Volume.SizeGiB = 2
+	if string(original.SecretData["k"]) != "secret" || original.Env["A"] != "1" || original.Volume.SizeGiB != 1 {
 		t.Fatal("clone shares mutable state")
 	}
 }

@@ -7,7 +7,8 @@ keeps the target in sync with ongoing changes (**CDC**), and you trigger
 
 > **Status: v0.1 draft.** Engines: **MongoDB → MongoDB** built on
 > [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-> (PCSM), and **PostgreSQL → PostgreSQL** built on native logical replication.
+> (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication, and
+> **MySQL → MySQL** built on native GTID replication.
 > The plugin appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
@@ -35,14 +36,16 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
 3. **Cutover**: stop writes on the source, wait for lag ≈ 0, then click
    **Cutover**. The engine finalizes the target (PCSM: indexes and other
    catalog work; PostgreSQL: sequences, materialized views, and removing the
-   replication slot and publication from the source).
+   replication slot and publication from the source; MySQL: waiting for the
+   source's GTID set, removing the replication channel, and enabling events).
 4. **Delete**: removes the worker. Data on the target is kept. Engines that
    leave replication state behind (PostgreSQL) clean it up first.
 
 The backend has no database. Migration records are ConfigMaps, so migrations
 survive backend restarts and upgrades. Worker progress is checkpointed by the
 engine itself (PCSM stores checkpoints in the target cluster; PostgreSQL keeps
-the replication state in the target's subscription and the source's slot).
+the replication state in the target's subscription and the source's slot;
+MySQL keeps it in the target's replication channel and GTID set).
 
 ## Engines
 
@@ -50,6 +53,7 @@ the replication state in the target's subscription and the source's slot).
 | --- | --- | --- | --- |
 | `pcsm` | MongoDB (OpenEverest `percona-server-mongodb` instance or external URI) | OpenEverest `percona-server-mongodb` instance | `percona/percona-clustersync-mongodb:1.0.0` |
 | `postgres-logical` | PostgreSQL 13+ (OpenEverest instance or external URI) | OpenEverest `percona-postgresql` instance (PostgreSQL 15+) | `ghcr.io/openeverest/plugin-migrations-postgres-logical` |
+| `mysql-replication` | MySQL 8.0+ / Percona Server / PXC (OpenEverest `percona-xtradb-cluster` instance or external URI) | OpenEverest `percona-xtradb-cluster` instance (8.0.23+) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
@@ -63,11 +67,19 @@ filters, table excludes, and *recreate the target database*. See
 [workers/postgres-logical/README.md](workers/postgres-logical/README.md) and the
 options tables in [docs/architecture.md](docs/architecture.md) (§8).
 
+`mysql-replication` migrates one or more databases. MySQL Shell copies a
+consistent snapshot (tables, views, routines, triggers and events), then the
+**target** replicates from the source over a GTID replication channel, schema
+changes included. Options: the databases, table excludes, *recreate the target
+databases*, and the number of copy threads. See
+[workers/mysql-replication/README.md](workers/mysql-replication/README.md).
+
 ### Adding an engine
 
 1. Backend: implement `engine.Engine` in `backend/internal/engine/<id>/`
    (`Prepare` builds the worker spec; `Controller` drives the running worker
-   and maps its state onto the shared phases). Register its constructor in
+   and maps its state onto the shared phases; workers built on the agent API
+   in `workers/` reuse `engine/agentclient`). Register its constructor in
    `compiledEngines` in `backend/main.go`.
 2. Helm: add `engines.<id>` (enabled flag and image) to `values.yaml`.
 3. Frontend: add `src/engines/<id>/` (label, compatible providers, default
@@ -92,6 +104,8 @@ Then open **Migrations** in the OpenEverest sidebar.
 | `engines.pcsm.image.*` | PCSM worker image | `percona/percona-clustersync-mongodb:1.0.0` |
 | `engines.postgres-logical.enabled` | Enable the PostgreSQL logical replication engine | `true` |
 | `engines.postgres-logical.image.*` | PostgreSQL worker image | `ghcr.io/openeverest/plugin-migrations-postgres-logical` (chart version) |
+| `engines.mysql-replication.enabled` | Enable the MySQL replication engine | `true` |
+| `engines.mysql-replication.image.*` | MySQL worker image | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
@@ -133,6 +147,24 @@ PostgreSQL (`postgres-logical`):
   source is gone, delete with **Delete anyway** (API: `DELETE
   /api/migrations/{id}?force=true`) and drop the slot yourself.
 
+MySQL (`mysql-replication`):
+
+- Source: MySQL 8.0+ (Percona Server, PXC, RDS/Aurora MySQL; not MariaDB) with
+  binary logging, `gtid_mode=ON` and `binlog_format=ROW`, and a user with
+  `REPLICATION SLAVE` that can read the migrated databases (`SELECT`, `SHOW
+  VIEW`, `TRIGGER`, `EVENT`, and `RELOAD` or `BACKUP_ADMIN` for the consistent
+  snapshot) and create the `openeverest_migration` heartbeat database.
+- Target: an OpenEverest `percona-xtradb-cluster` instance (8.0.23+), the same
+  or a newer version. Every migrated table must be InnoDB with a primary key;
+  preflight lists the tables that are not.
+- The **target instance** connects to the source, not only the worker pod.
+- Schema changes replicate, so they need not be frozen. User accounts and
+  grants are not copied: create the application users on the target.
+- The databases must not exist on the target, or enable *Recreate the target
+  databases*.
+- The source keeps binary logs on its own schedule. If the copy or a pause
+  outlasts its retention, the migration fails and must be created again.
+
 ## Development
 
 ```bash
@@ -140,6 +172,7 @@ npm install
 make frontend     # tsc + vite build (dist/main.js) + vitest
 make backend      # gofmt + go vet + go test + go build
 (cd workers/postgres-logical && go test ./...)   # PostgreSQL worker agent
+(cd workers/mysql-replication && go test ./...)  # MySQL worker agent
 make helm-lint
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```

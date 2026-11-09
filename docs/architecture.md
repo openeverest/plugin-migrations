@@ -1,6 +1,6 @@
 # plugin-migrations — Architecture
 
-> Status: **Draft v0.1** · Last updated: 2026-11-04
+> Status: **Draft v0.1** · Last updated: 2026-11-08
 
 `plugin-migrations` is an OpenEverest generic plugin that moves data **into**
 OpenEverest-managed databases with minimal downtime. It works like
@@ -14,8 +14,9 @@ plugs into a shared lifecycle, storage, API and UI, the same way
 plugin-bench adds benchmark drivers. The engines are **MongoDB → MongoDB**
 built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-(PCSM), and **PostgreSQL → PostgreSQL** built on native logical replication
-(`postgres-logical`).
+(PCSM), **PostgreSQL → PostgreSQL** built on native logical replication
+(`postgres-logical`), and **MySQL → MySQL** built on native GTID replication
+(`mysql-replication`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -71,7 +72,9 @@ Backend layers (Go, `backend/internal/...`):
 | --- | --- | --- |
 | `engine` | Technology-agnostic contracts: `Engine`, `Controller`, `WorkerSpec`, `Status`, `Phase`; engine registry. | Nothing else |
 | `engine/pcsm` | MongoDB engine: option validation, worker spec (image, env, secrets), PCSM HTTP client, and mapping PCSM state to `engine.Status`. | `engine` |
-| `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), client for the agent in `workers/postgres-logical`, teardown. | `engine` |
+| `engine/agentclient` | HTTP client for the agents in `workers/` (one API: status, start, pause, resume, cutover, teardown) and the mapping of agent states to `engine.Status`. | `engine` |
+| `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), teardown. | `engine`, `engine/agentclient` |
+| `engine/mysqlreplication` | MySQL engine: option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files), teardown. | `engine`, `engine/agentclient` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
 | `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
@@ -179,6 +182,13 @@ PCSM mapping:
 Lag is the source's `now()` minus the last heartbeat replicated to the target,
 so it uses only the source clock.
 
+`mysql-replication` uses the same agent states and phases. `full-load` covers
+the preflight and the MySQL Shell copy; once the channel runs, the phase is
+`catching-up` until the replicated heartbeat lag is 15s or less (then
+`replicating`). A channel stopped by an applier error stays `replicating` (or
+`catching-up`) with the error shown; the agent restarts it every minute, so it
+continues once the cause is fixed.
+
 ### Allowed actions
 
 The backend computes `allowedActions` so the UI does not duplicate engine rules.
@@ -250,7 +260,8 @@ it later (for GitOps) without changing the domain service.
    action is allowed for the live phase, then call the controller.
 4. **Delete**: if the engine's controller is a `Teardowner` and the migration
    was started, call `Teardown` first (PostgreSQL: drop the subscription, the
-   source slot and publication, and the heartbeat tables). A failed teardown
+   source slot and publication, and the heartbeat tables; MySQL: remove the
+   replication channel and the `openeverest_migration` databases). A failed teardown
    returns 502 and keeps the record, so nothing is left retaining WAL
    silently; `?force=true` skips it when the source no longer exists. Then
    delete the ConfigMap. The worker stops and data already written to the
@@ -401,6 +412,34 @@ Only `provider-percona-postgresql` targets are offered, because `CREATE
 SUBSCRIPTION` needs the superuser that its connection details provide. The
 source and target must be different servers.
 
+### MySQL engine options (`engine: "mysql-replication"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `databases` | `string[]` | database in the source URI | Required for instance sources. Databases keep their names on the target. System databases and `openeverest_migration` cannot be migrated. |
+| `excludeTables` | `string[]` (`database.table`) | `[]` | Neither copied nor replicated (`REPLICATE_IGNORE_TABLE`). Must belong to a migrated database. |
+| `recreateDatabases` | `bool` | `false` | Drop the databases on the target first. Otherwise an existing database fails the preflight. |
+| `copyThreads` | `int` (1–32) | `4` | MySQL Shell threads reading the source, and as many writing to the target. |
+
+Views, routines, triggers and events whose definer holds `SYSTEM_USER` on
+the target (for example `root@localhost`) are recreated with the target user
+as definer, because that user lacks `SYSTEM_USER`. Each migration has its own
+heartbeat table, so several migrations can share a source.
+
+Only `percona-xtradb-cluster` targets are offered: their connection details
+are `root`, which can configure replication, `gtid_purged` and `local_infile`,
+and PXC runs with `skip_replica_start`, which keeps a restarted node from
+replicating before the worker restores the channel filters (MySQL does not
+persist them). The worker pins the channel to the PXC node behind the proxy
+(`wsrep_node_incoming_address`), because the copy's `gtid_purged` exists only
+on that node. See [workers/mysql-replication](../workers/mysql-replication/README.md).
+
+Source URIs may set `ssl-mode` (MySQL client names) or `tls` (Go driver
+names, as OpenEverest providers publish: `tls=false` is `DISABLED`). A CA
+certificate makes the worker verify the server (`VERIFY_CA`); verifying modes
+without a CA are rejected. The target server's replication connection uses TLS
+unless the source is `DISABLED`, but cannot verify it.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -428,6 +467,9 @@ source and target must be different servers.
   (`percona/percona-clustersync-mongodb:1.0.0`).
 - `engines.postgres-logical.enabled` and `engines.postgres-logical.image`
   (`ghcr.io/openeverest/plugin-migrations-postgres-logical`, released with
+  the plugin).
+- `engines.mysql-replication.enabled` and `engines.mysql-replication.image`
+  (`ghcr.io/openeverest/plugin-migrations-mysql-replication`, released with
   the plugin).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
@@ -465,6 +507,28 @@ source and target must be different servers.
 8. **PostgreSQL schema changes.** DDL is not replicated; the user must freeze
    it until cutover. Operator-managed schemas (`pgbouncer`) differ between
    providers and are excluded by a fixed list.
+9. **MySQL binary log retention.** Unlike a PostgreSQL slot, a replication
+   channel does not make the source keep its binary logs. If the copy or a
+   pause outlasts the source's retention, the channel fails with error 1236
+   and the migration must be created again. A preflight warning based on
+   `binlog_expire_logs_seconds` (RDS: binlog retention hours) would help.
+10. **MySQL channel placement on PXC.** The channel and the copy's
+    `gtid_purged` live on one node. A restarted node keeps them and the worker
+    restarts the channel; a node rebuilt by SST loses them, and the migration
+    fails. Appending `gtid_purged` on every node, or the operator's
+    `replicationChannels` (which also moves the channel when the primary
+    changes), would let the channel follow the primary; the latter needs
+    provider support.
+11. **MySQL filters and non-table DDL.** Table filters do not match statements
+    that touch no table (`CREATE PROCEDURE other.p`). The worker skips such a
+    transaction when it fails with *Unknown database* for a database that is
+    not migrated; any other failure stops the channel and is reported.
+    Database filters (`REPLICATE_DO_DB`) are not used: they match DDL by the
+    session's default database and would skip qualified DDL silently.
+12. **MySQL targets other than PXC.** provider-percona-server-mysql publishes
+    no connection URI, which the backend requires, and Group Replication
+    primaries change. Supporting it needs a URI from the provider and a plan
+    for primary changes.
 
 ## 12. Roadmap
 
@@ -477,6 +541,9 @@ source and target must be different servers.
   replication, promote at cutover) for whole-cluster migrations with DDL. It
   needs provider support to create an instance as a standby and promote it.
   `pgcopydb` was evaluated and set aside until its CDC fixes are released.
-- Next engines: MySQL (Percona XtraBackup + replication, or a binlog-based CDC
-  tool).
+- MySQL: a physical engine (restore an XtraBackup backup into the target,
+  then attach the replication channel) for large databases, which needs
+  provider support; MariaDB → MariaDB with MariaDB GTIDs; Percona Server
+  (Group Replication) targets.
+- Cross-engine migrations (for example with Debezium Server and its JDBC sink).
 - Optional Migration CRD and controller for GitOps.

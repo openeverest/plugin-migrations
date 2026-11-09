@@ -158,7 +158,10 @@ func (w *Workloads) podSpec(record migration.Record, worker engine.WorkerSpec, c
 			items = append(items, corev1.KeyToPath{Key: key, Path: worker.SecretFiles[key]})
 		}
 		volumes = append(volumes, corev1.Volume{Name: secretsVolumeName, VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: record.ID, Items: items, DefaultMode: ptr.To[int32](0o440)},
+			// Files are owned by root and workers run as their image's own
+			// non-root user, which the plugin does not know. Only this pod
+			// mounts the volume, so world-readable means readable by the worker.
+			Secret: &corev1.SecretVolumeSource{SecretName: record.ID, Items: items, DefaultMode: ptr.To[int32](0o444)},
 		}})
 	}
 	return corev1.PodSpec{

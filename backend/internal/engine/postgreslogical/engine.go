@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/openeverest/plugin-migrations/backend/internal/engine"
+	"github.com/openeverest/plugin-migrations/backend/internal/engine/agentclient"
 )
 
 const (
@@ -167,5 +168,15 @@ func invalidRequest(format string, args ...any) error {
 }
 
 func (e *Engine) Controller(baseURL string) engine.Controller {
-	return &controller{baseURL: baseURL, httpClient: e.httpClient, teardownClient: e.teardownClient}
+	return agentclient.New(baseURL, e.httpClient, e.teardownClient, startBody)
+}
+
+// startBody sends the worker its options; the database is already part of
+// the connection strings it receives.
+func startBody(raw json.RawMessage) (any, error) {
+	options, err := decodeOptions(raw)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"options": options.worker()}, nil
 }

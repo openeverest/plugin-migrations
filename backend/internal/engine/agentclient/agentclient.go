@@ -1,4 +1,7 @@
-package postgreslogical
+// Package agentclient drives the migration agents built in this repository
+// (workers/postgres-logical, workers/mysql-replication). They share one HTTP
+// API: GET /status, POST /start, /pause, /resume, /cutover and /teardown.
+package agentclient
 
 import (
 	"bytes"
@@ -15,14 +18,25 @@ import (
 
 const maxResponseBytes = 1 << 20
 
-type controller struct {
+// StartBody turns the stored engine options into the agent's /start body.
+type StartBody func(options json.RawMessage) (any, error)
+
+// Client implements engine.Controller and engine.Teardowner.
+type Client struct {
 	baseURL        string
 	httpClient     *http.Client
 	teardownClient *http.Client
+	startBody      StartBody
 }
 
-// agentStatus is the worker agent's GET /status body.
-type agentStatus struct {
+// New returns a client for the agent at baseURL. Teardown gets its own,
+// usually longer, timeout.
+func New(baseURL string, httpClient, teardownClient *http.Client, startBody StartBody) *Client {
+	return &Client{baseURL: baseURL, httpClient: httpClient, teardownClient: teardownClient, startBody: startBody}
+}
+
+// AgentStatus is the agent's GET /status body.
+type AgentStatus struct {
 	State                string `json:"state"`
 	Message              string `json:"message"`
 	Error                string `json:"error"`
@@ -33,39 +47,40 @@ type agentStatus struct {
 	LagSeconds           int64  `json:"lagSeconds"`
 }
 
-func (c *controller) Start(ctx context.Context, rawOptions json.RawMessage) error {
-	options, err := decodeOptions(rawOptions)
+func (c *Client) Start(ctx context.Context, options json.RawMessage) error {
+	body, err := c.startBody(options)
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, c.httpClient, http.MethodPost, "/start", map[string]any{"options": options.worker()}, nil)
+	return c.do(ctx, c.httpClient, http.MethodPost, "/start", body, nil)
 }
 
-func (c *controller) Pause(ctx context.Context) error {
+func (c *Client) Pause(ctx context.Context) error {
 	return c.do(ctx, c.httpClient, http.MethodPost, "/pause", nil, nil)
 }
 
-func (c *controller) Resume(ctx context.Context) error {
+func (c *Client) Resume(ctx context.Context) error {
 	return c.do(ctx, c.httpClient, http.MethodPost, "/resume", nil, nil)
 }
 
-func (c *controller) Cutover(ctx context.Context) error {
+func (c *Client) Cutover(ctx context.Context) error {
 	return c.do(ctx, c.httpClient, http.MethodPost, "/cutover", nil, nil)
 }
 
-func (c *controller) Teardown(ctx context.Context) error {
+func (c *Client) Teardown(ctx context.Context) error {
 	return c.do(ctx, c.teardownClient, http.MethodPost, "/teardown", nil, nil)
 }
 
-func (c *controller) Status(ctx context.Context) (engine.Status, error) {
-	var response agentStatus
+func (c *Client) Status(ctx context.Context) (engine.Status, error) {
+	var response AgentStatus
 	if err := c.do(ctx, c.httpClient, http.MethodGet, "/status", nil, &response); err != nil {
 		return engine.Status{}, err
 	}
-	return mapStatus(response)
+	return MapStatus(response)
 }
 
-func mapStatus(response agentStatus) (engine.Status, error) {
+// MapStatus maps the agent's states onto the shared phases.
+func MapStatus(response AgentStatus) (engine.Status, error) {
 	status := engine.Status{
 		Message:              response.Message,
 		Error:                response.Error,
@@ -107,7 +122,7 @@ func mapStatus(response agentStatus) (engine.Status, error) {
 	return status, nil
 }
 
-func (c *controller) do(ctx context.Context, client *http.Client, method, path string, body, destination any) error {
+func (c *Client) do(ctx context.Context, client *http.Client, method, path string, body, destination any) error {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)

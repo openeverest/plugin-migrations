@@ -68,6 +68,16 @@ engines:
       repository: ghcr.io/openeverest/plugin-migrations-postgres-logical
       tag: "0.1.0"
       pullPolicy: IfNotPresent
+  # MySQL → MySQL (PXC targets) with native GTID replication: MySQL Shell
+  # copies the databases, then the target replicates from the source. The
+  # worker image only drives it: see workers/mysql-replication. Released
+  # together with the plugin.
+  mysql-replication:
+    enabled: true
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-mysql-replication
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

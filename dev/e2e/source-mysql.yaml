@@ -1,0 +1,52 @@
+# Stand-in for an external MySQL: binary log with GTIDs and row format, data
+# in an emptyDir. root has REPLICATION SLAVE and everything the copy needs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legacy
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: source-mysql
+  namespace: legacy
+stringData:
+  MYSQL_ROOT_PASSWORD: source-secret-pw
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: source-mysql
+  namespace: legacy
+spec:
+  clusterIP: None
+  selector: {app: source-mysql}
+  ports: [{name: mysql, port: 3306}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: source-mysql
+  namespace: legacy
+spec:
+  serviceName: source-mysql
+  replicas: 1
+  selector: {matchLabels: {app: source-mysql}}
+  template:
+    metadata: {labels: {app: source-mysql}}
+    spec:
+      containers:
+        - name: mysql
+          image: percona/percona-server:8.0
+          args: ["--server-id=1", "--log-bin=binlog", "--gtid-mode=ON", "--enforce-gtid-consistency=ON",
+                 "--binlog-format=ROW", "--innodb-buffer-pool-size=128M"]
+          envFrom: [{secretRef: {name: source-mysql}}]
+          ports: [{containerPort: 3306}]
+          resources:
+            requests: {cpu: 100m, memory: 384Mi}
+            limits: {memory: 1Gi}
+          readinessProbe:
+            exec: {command: ["sh", "-c", "mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]}
+            periodSeconds: 5
+          volumeMounts: [{name: data, mountPath: /var/lib/mysql}]
+      volumes: [{name: data, emptyDir: {}}]

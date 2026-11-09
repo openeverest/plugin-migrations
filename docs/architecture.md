@@ -1,6 +1,6 @@
 # plugin-migrations — Architecture
 
-> Status: **Draft v0.1** · Last updated: 2026-11-08
+> Status: **Draft v0.1** · Last updated: 2026-11-09
 
 `plugin-migrations` is an OpenEverest generic plugin that moves data **into**
 OpenEverest-managed databases with minimal downtime. It works like
@@ -15,8 +15,8 @@ plugin-bench adds benchmark drivers. The engines are **MongoDB → MongoDB**
 built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
 (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication
-(`postgres-logical`), and **MySQL → MySQL** built on native GTID replication
-(`mysql-replication`).
+(`postgres-logical`), and **MySQL → MySQL** and **MariaDB → MariaDB** built
+on native GTID replication (`mysql-replication`, `mariadb-replication`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -74,7 +74,7 @@ Backend layers (Go, `backend/internal/...`):
 | `engine/pcsm` | MongoDB engine: option validation, worker spec (image, env, secrets), PCSM HTTP client, and mapping PCSM state to `engine.Status`. | `engine` |
 | `engine/agentclient` | HTTP client for the agents in `workers/` (one API: status, start, pause, resume, cutover, teardown) and the mapping of agent states to `engine.Status`. | `engine` |
 | `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), teardown. | `engine`, `engine/agentclient` |
-| `engine/mysqlreplication` | MySQL engine: option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files), teardown. | `engine`, `engine/agentclient` |
+| `engine/mysqlreplication` | MySQL and MariaDB engines (one worker image, `FLAVOR` env): option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files; provider-mariadb admin connections), teardown. | `engine`, `engine/agentclient` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
 | `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
@@ -182,8 +182,9 @@ PCSM mapping:
 Lag is the source's `now()` minus the last heartbeat replicated to the target,
 so it uses only the source clock.
 
-`mysql-replication` uses the same agent states and phases. `full-load` covers
-the preflight and the MySQL Shell copy; once the channel runs, the phase is
+`mysql-replication` and `mariadb-replication` use the same agent states and
+phases. `full-load` covers the preflight and the copy (MySQL Shell or
+mydumper/myloader); once the channel runs, the phase is
 `catching-up` until the replicated heartbeat lag is 15s or less (then
 `replicating`). A channel stopped by an applier error stays `replicating` (or
 `catching-up`) with the error shown; the agent restarts it every minute, so it
@@ -440,6 +441,38 @@ certificate makes the worker verify the server (`VERIFY_CA`); verifying modes
 without a CA are rejected. The target server's replication connection uses TLS
 unless the source is `DISABLED`, but cannot verify it.
 
+### MariaDB engine options (`engine: "mariadb-replication"`)
+
+The options are those of `mysql-replication`; `copyThreads` sets mydumper's
+and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
+
+- mydumper streams a consistent snapshot (`BACKUP STAGE BLOCK_COMMIT`) into
+  myloader through the worker, which reads the snapshot's GTID position from
+  the stream's `metadata` file. Nothing is written to the worker's disk except
+  the tools' option files (credentials never appear in a command line).
+- The target sets `gtid_slave_pos` and replicates over a named connection
+  (`CHANGE MASTER 'mig_…'`, `MASTER_USE_GTID=slave_pos`) with the same table
+  filters, set through the connection's `replicate_*` variables. MariaDB
+  has no `SYSTEM_USER`, so definers are kept.
+- OpenEverest instances are reached with the admin (root) connection that
+  provider-mariadb 0.2.2+ publishes as `admin-*` keys, which the backend
+  reads from the instance's connection details (`engine.Connection.Properties`).
+  The application user cannot replicate. Only targets whose provider
+  publishes `admin-skip-replica-start=true` (standalone and Galera: started
+  with `skip-slave-start`) are accepted. MariaDB does not expose that setting
+  as a variable, so the worker cannot check it itself. A replication-topology
+  target is refused: the operator does not start a replica's server again
+  after its own replication changes, and a switchover resets
+  `gtid_slave_pos`.
+- On Galera, `gtid_slave_pos` is per node, so the channel is pinned to the
+  node behind the Service: the entry of `wsrep_cluster_address` named after
+  `wsrep_node_name` (mariadb-operator leaves `wsrep_node_incoming_address`
+  at `AUTO`).
+- Versions: source 10.6+, target 10.11+ and the same or a newer series.
+  Preflight also requires `binlog_format=ROW` and different `server_id`s on
+  the source and the target (both engines check this: a replica ignores
+  changes carrying its own `server_id`).
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -471,6 +504,8 @@ unless the source is `DISABLED`, but cannot verify it.
 - `engines.mysql-replication.enabled` and `engines.mysql-replication.image`
   (`ghcr.io/openeverest/plugin-migrations-mysql-replication`, released with
   the plugin).
+- `engines.mariadb-replication.enabled` and `engines.mariadb-replication.image`
+  (the same image as `mysql-replication`).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
@@ -529,6 +564,18 @@ unless the source is `DISABLED`, but cannot verify it.
     no connection URI, which the backend requires, and Group Replication
     primaries change. Supporting it needs a URI from the provider and a plan
     for primary changes.
+13. **MariaDB targets.** The same binary log retention and channel placement
+    limits apply (a Galera node rebuilt by SST loses `gtid_slave_pos`). On
+    Galera, account statements (`CREATE/ALTER/DROP USER`, roles, `GRANT`,
+    `REVOKE`) from the source reach the other nodes: `mysql_execute_command`
+    begins total order isolation before the ACL code checks the replication
+    filters, so the replica node skips them while the rest of the cluster
+    executes them (verified on MariaDB 12.3; PXC filters them first). The
+    worker cannot prevent this; the UI warns users not to change accounts on
+    the source during a Galera migration. A fix belongs upstream.
+    Replication-topology targets need the operator to keep a migration
+    connection across restarts and switchovers. Grants through roles are not
+    seen by the source privilege check (`SHOW GRANTS` of the user only).
 
 ## 12. Roadmap
 
@@ -543,7 +590,7 @@ unless the source is `DISABLED`, but cannot verify it.
   `pgcopydb` was evaluated and set aside until its CDC fixes are released.
 - MySQL: a physical engine (restore an XtraBackup backup into the target,
   then attach the replication channel) for large databases, which needs
-  provider support; MariaDB → MariaDB with MariaDB GTIDs; Percona Server
-  (Group Replication) targets.
+  provider support; Percona Server (Group Replication) targets; MariaDB
+  replication-topology targets.
 - Cross-engine migrations (for example with Debezium Server and its JDBC sink).
 - Optional Migration CRD and controller for GitOps.

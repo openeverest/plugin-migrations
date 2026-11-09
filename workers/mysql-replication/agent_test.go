@@ -122,7 +122,7 @@ func goodFacts() (sourceFacts, targetFacts) {
 func TestCheckPreflight(t *testing.T) {
 	options := Options{Databases: []string{"shop"}, CopyThreads: 4}
 	source, target := goodFacts()
-	if err := checkPreflight(source, target, options); err != nil {
+	if err := checkPreflight(mysqlFlavor{}, source, target, options); err != nil {
 		t.Fatalf("valid setup rejected: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func TestCheckPreflight(t *testing.T) {
 	target.Info = serverInfo{Version: "8.0.22", UUID: "b", GTIDMode: "OFF", Galera: true}
 	target.Existing = []string{"shop"}
 	target.ChannelExists = true
-	err := checkPreflight(source, target, options)
+	err := checkPreflight(mysqlFlavor{}, source, target, options)
 	if err == nil {
 		t.Fatal("invalid setup accepted")
 	}
@@ -152,19 +152,19 @@ func TestCheckPreflight(t *testing.T) {
 
 	source, target = goodFacts()
 	source.Info.Version, target.Info.Version = "8.4.3", "8.0.45-36.1"
-	if err := checkPreflight(source, target, options); err == nil || !strings.Contains(err.Error(), "older than the source") {
+	if err := checkPreflight(mysqlFlavor{}, source, target, options); err == nil || !strings.Contains(err.Error(), "older than the source") {
 		t.Fatalf("a downgrade must be rejected: %v", err)
 	}
 	source, target = goodFacts()
 	source.Info.Version, source.Info.Comment = "10.11.6-MariaDB", "MariaDB Server"
-	if err := checkPreflight(source, target, options); err == nil || !strings.Contains(err.Error(), "MariaDB") {
+	if err := checkPreflight(mysqlFlavor{}, source, target, options); err == nil || !strings.Contains(err.Error(), "MariaDB") {
 		t.Fatalf("MariaDB must be rejected: %v", err)
 	}
 	source, target = goodFacts()
 	source.Unsupported, target.Info.Galera = []string{"shop.nopk"}, false
 	target.Existing = []string{"shop"}
-	if err := checkPreflight(source, target, Options{Databases: []string{"shop"}, RecreateDatabases: true}); err != nil {
-		t.Fatalf("tables without a primary key are fine outside PXC, and recreate allows existing databases: %v", err)
+	if err := checkPreflight(mysqlFlavor{}, source, target, Options{Databases: []string{"shop"}, RecreateDatabases: true}); err != nil {
+		t.Fatalf("tables without a primary key are fine outside Galera, and recreate allows existing databases: %v", err)
 	}
 }
 
@@ -229,7 +229,6 @@ func TestSkippableDatabase(t *testing.T) {
 	for name, change := range map[string]func(*workerError){
 		"migrated database": func(f *workerError) { f.Message = strings.ReplaceAll(f.Message, "'other'", "'shop'") },
 		"other error":       func(f *workerError) { f.Number = 1146 },
-		"no transaction":    func(f *workerError) { f.Transaction = "" },
 		"migration db":      func(f *workerError) { f.Message = "Unknown database 'openeverest_migration'" },
 	} {
 		copy := failure

@@ -1,6 +1,6 @@
 import { isRecord, readBoolean, readNumber, readStringArray } from '../../utils/guards.utils';
 import type { EngineOptionsErrors, OptionSummaryItem } from '../engine.types';
-import { COPY_THREADS, MYSQL_URI_SCHEME, NAME_PATTERN, SYSTEM_DATABASES } from './mysql-replication.constants';
+import { COPY_THREADS, MYSQL_URI_SCHEMES, NAME_PATTERN, SYSTEM_DATABASES } from './mysql-replication.constants';
 import { Messages } from './mysql-replication.messages';
 import type { MysqlReplicationOptions, MysqlReplicationOptionsDraft } from './mysql-replication.types';
 
@@ -82,15 +82,21 @@ export function summarizeMysqlReplicationOptions(options: unknown): OptionSummar
   ];
 }
 
-export function validateMysqlUri(uri: string): string | undefined {
+/** Validates a single-host URI with one of schemes (e.g. "mysql://"). */
+export function validateMysqlCompatibleUri(uri: string, schemes: readonly string[]): string | undefined {
   const trimmed = uri.trim();
   if (trimmed === '') return Messages.uriRequired;
-  if (!trimmed.toLowerCase().startsWith(MYSQL_URI_SCHEME)) return Messages.uriScheme;
-  const rest = trimmed.slice(MYSQL_URI_SCHEME.length);
+  const scheme = schemes.find((candidate) => trimmed.toLowerCase().startsWith(candidate));
+  if (scheme === undefined) return Messages.uriScheme(schemes);
+  const rest = trimmed.slice(scheme.length);
   const authorityEnd = rest.search(/[/?#]/);
   const authority = authorityEnd < 0 ? rest : rest.slice(0, authorityEnd);
   const hosts = authority.slice(authority.lastIndexOf('@') + 1);
   if (hosts.trim() === '') return Messages.uriHost;
   if (hosts.includes(',')) return Messages.uriMultiHost;
   return undefined;
+}
+
+export function validateMysqlUri(uri: string): string | undefined {
+  return validateMysqlCompatibleUri(uri, MYSQL_URI_SCHEMES);
 }

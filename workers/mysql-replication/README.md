@@ -1,17 +1,20 @@
 # mysql-replication worker
 
-The worker image for the `mysql-replication` engine. It migrates MySQL
-databases into an OpenEverest MySQL instance with **native GTID
-replication**. MySQL Shell copies the data; then the target server replicates
+The worker image for the `mysql-replication` and `mariadb-replication`
+engines. It migrates MySQL (or MariaDB) databases into an OpenEverest MySQL
+(or MariaDB) instance with **native GTID replication**. MySQL Shell (MySQL) or
+mydumper/myloader (MariaDB) copies the data; then the target server replicates
 from the source over its own replication channel until the cutover. The worker
 moves no rows after the copy: the target server reads the source's binary log
 directly.
 
 The image is `mysql:8.4` (for MySQL Shell, `mysqlsh`; the server in it is
-never started) plus a Go agent. It runs as the `mysql` user (999:999) and
-listens on `:2243`.
+never started) with mydumper/myloader, plus a Go agent. It runs as the
+`mysql` user (999:999) and listens on `:2243`. `FLAVOR` selects MySQL or
+MariaDB; the lifecycle below is shared, and [MariaDB](#mariadb) lists what
+differs.
 
-## Flow
+## Flow (MySQL)
 
 1. **Preflight**. Source: MySQL 8.0+ (not MariaDB), binary logging,
    `gtid_mode=ON`, `binlog_format=ROW`, a user with `REPLICATION SLAVE`, and
@@ -66,6 +69,42 @@ listens on `:2243`.
    recreated by the agent from `SHOW CREATE` with `DEFINER=CURRENT_USER`, the
    same SQL mode, character set and time zone; `SQL SECURITY` is unchanged.
 
+## MariaDB
+
+With `FLAVOR=mariadb` the same flow runs with MariaDB's statements:
+
+- **Preflight**: source MariaDB 10.6+, target 10.11+ of the same or a newer
+  series; `REPLICATION SLAVE` is read from `SHOW GRANTS` (grants through roles
+  are not seen). MariaDB does not expose `skip-slave-start` as a variable, so
+  the backend passes `TARGET_SKIP_REPLICA_START=true` only for targets whose
+  provider starts them with it; without it the preflight fails. Both flavors
+  require different `server_id`s on the source and the target.
+- **Replica node**: on Galera, the entry of `wsrep_cluster_address` named
+  after `wsrep_node_name` (`wsrep_node_incoming_address` is usually `AUTO`).
+  `gtid_slave_pos` is per node, like `gtid_purged` on PXC.
+- **Copy**: `mydumper --stream` (consistent through `BACKUP STAGE
+  BLOCK_COMMIT`, with routines, events and triggers) is piped into `myloader
+  --stream` through the agent, which counts the data files for the progress
+  and reads the snapshot's `executed_gtid_set` from the final `metadata` file.
+  Credentials go to `0600` option files in the work directory. Copied events
+  are set to `DISABLE ON SLAVE`.
+- **Replication**: `SET GLOBAL gtid_slave_pos`, then `CHANGE MASTER 'mig_<id>'
+  TO … MASTER_USE_GTID=slave_pos`. The filters are the connection's
+  `mig_<id>.replicate_wild_do_table` and `mig_<id>.replicate_ignore_table`
+  variables, also not persisted across restarts.
+- **Supervision**: an *Unknown database* failure for a database that is not
+  migrated is skipped with `sql_slave_skip_counter` on the connection.
+- **Galera and account statements**: MariaDB begins Galera's total order
+  isolation for `CREATE/ALTER/DROP USER`, roles, `GRANT` and `REVOKE` before
+  it applies the replication filters, so such statements from the source are
+  skipped on the replica node but run on the other nodes. Accounts must not
+  change on the source during a migration into Galera.
+- **Cutover**: the source's `@@gtid_binlog_pos`, waited for with
+  `MASTER_GTID_WAIT`; the connection is removed with `RESET SLAVE 'mig_<id>'
+  ALL`. Definers are kept (MariaDB has no `SYSTEM_USER`). On Galera, events
+  then run only on the replica node; the other nodes show them as
+  `SLAVESIDE_DISABLED`, as for any event created on a Galera node.
+
 ## HTTP API
 
 | Route | Description |
@@ -87,6 +126,8 @@ Start options: `databases` (required), `excludeTables` (`database.table`),
 | `SOURCE_URI` | `mysql://user:password@host:port/?ssl-mode=…&ssl-ca=…` of the source. The target server connects with the same user and host for replication. |
 | `TARGET_URI` | The target, usually its proxy (HAProxy or ProxySQL). |
 | `REPLICATION_NAME` | Channel name (`mig_<id>`, at most 54 characters); also names the heartbeat table. |
+| `FLAVOR` | `mysql` (default) or `mariadb`. |
+| `TARGET_SKIP_REPLICA_START` | `true` when the MariaDB target is known to start with `skip-slave-start` (required for `mariadb`). |
 | `HEARTBEAT_INTERVAL` | Heartbeat and supervision period (default `5s`). |
 
 `ssl-mode` uses MySQL client names (`DISABLED`, `PREFERRED`, `REQUIRED`,
@@ -104,8 +145,8 @@ exists only in the worker.
   channel cannot continue and the migration must be created again.
 - Tables excluded from the migration must not be referenced by foreign keys
   of migrated tables.
-- PXC rejects writesets larger than `wsrep_max_ws_size` (2 GiB), so a single
-  source transaction cannot be larger.
+- Galera (PXC and MariaDB) rejects writesets larger than `wsrep_max_ws_size`
+  (2 GiB), so a single source transaction cannot be larger.
 
 ## Development
 

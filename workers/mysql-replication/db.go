@@ -100,21 +100,20 @@ type channelState struct {
 
 func (c channelState) stopped() bool { return c.IORunning == "No" && c.SQLRunning == "No" }
 
-func readChannel(ctx context.Context, db *sql.DB, name string) (channelState, error) {
-	rows, err := db.QueryContext(ctx, "SHOW REPLICA STATUS FOR CHANNEL ?", name)
-	if isServerError(err, errChannelNotExists) {
-		return channelState{}, nil
-	}
+// readRow returns the first row of a query as column → value; found is false
+// when there is no row.
+func readRow(ctx context.Context, db *sql.DB, query string, args ...any) (map[string]string, bool, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return channelState{}, err
+		return nil, false, err
 	}
 	defer rows.Close()
 	columns, err := rows.Columns()
 	if err != nil {
-		return channelState{}, err
+		return nil, false, err
 	}
 	if !rows.Next() {
-		return channelState{}, rows.Err()
+		return nil, false, rows.Err()
 	}
 	values := make([]sql.NullString, len(columns))
 	pointers := make([]any, len(columns))
@@ -122,21 +121,26 @@ func readChannel(ctx context.Context, db *sql.DB, name string) (channelState, er
 		pointers[i] = &values[i]
 	}
 	if err := rows.Scan(pointers...); err != nil {
-		return channelState{}, err
+		return nil, false, err
 	}
-	field := map[string]string{}
+	field := make(map[string]string, len(columns))
 	for i, column := range columns {
 		field[column] = values[i].String
 	}
-	var state channelState
-	state.Exists = true
-	state.IORunning, state.SQLRunning = field["Replica_IO_Running"], field["Replica_SQL_Running"]
+	return field, true, rows.Err()
+}
+
+// newChannelState reads SHOW REPLICA/SLAVE STATUS columns; prefix is "Replica"
+// for MySQL and "Slave" for MariaDB.
+func newChannelState(field map[string]string, prefix string) channelState {
+	state := channelState{Exists: true}
+	state.IORunning, state.SQLRunning = field[prefix+"_IO_Running"], field[prefix+"_SQL_Running"]
 	state.IOError, state.SQLError = field["Last_IO_Error"], field["Last_SQL_Error"]
 	_, _ = fmt.Sscan(field["Last_IO_Errno"], &state.IOErrno)
 	_, _ = fmt.Sscan(field["Last_SQL_Errno"], &state.SQLErrno)
 	state.WildDo = splitPatterns(field["Replicate_Wild_Do_Table"])
 	state.IgnoreTable = splitPatterns(field["Replicate_Ignore_Table"])
-	return state, rows.Err()
+	return state
 }
 
 func splitPatterns(value string) []string {
@@ -153,91 +157,11 @@ func samePatterns(a, b []string) bool {
 	return slices.Equal(a, b)
 }
 
-func channelStatement(ctx context.Context, db *sql.DB, statement, name string) error {
-	_, err := db.ExecContext(ctx, statement+" FOR CHANNEL ?", name)
-	return err
-}
-
-// setFilters sets exactly the migration's filters; the applier must be stopped.
-// MySQL does not persist channel filters across restarts, so they are set
-// again before every start.
-func setFilters(ctx context.Context, db *sql.DB, name string, options Options) error {
-	do := options.doPatterns(name)
-	// REPLICATE_IGNORE_TABLE takes identifiers; the names are validated.
-	ignore := make([]string, 0, len(options.ignoreTables()))
-	for _, table := range options.ignoreTables() {
-		database, tableName, _ := strings.Cut(table, ".")
-		ignore = append(ignore, quoteIdentifier(database)+"."+quoteIdentifier(tableName))
-	}
-	statement := "CHANGE REPLICATION FILTER REPLICATE_WILD_DO_TABLE = (" + placeholders(len(do)) +
-		"), REPLICATE_IGNORE_TABLE = (" + strings.Join(ignore, ", ") + "), REPLICATE_WILD_IGNORE_TABLE = (), " +
-		"REPLICATE_DO_TABLE = (), REPLICATE_DO_DB = (), REPLICATE_IGNORE_DB = () FOR CHANNEL ?"
-	args := make([]any, 0, len(do)+1)
-	for _, pattern := range do {
-		args = append(args, pattern)
-	}
-	_, err := db.ExecContext(ctx, statement, append(args, name)...)
-	return err
-}
-
 func placeholders(count int) string { return strings.TrimSuffix(strings.Repeat("?, ", count), ", ") }
-
-// startChannel stops the channel, sets its filters and starts it again.
-func startChannel(ctx context.Context, db *sql.DB, name string, options Options) error {
-	if err := channelStatement(ctx, db, "STOP REPLICA", name); err != nil {
-		return fmt.Errorf("stop replication: %s", serverError(err))
-	}
-	if err := setFilters(ctx, db, name, options); err != nil {
-		return fmt.Errorf("set the replication filters: %s", serverError(err))
-	}
-	if err := channelStatement(ctx, db, "START REPLICA", name); err != nil {
-		return fmt.Errorf("start replication: %s", serverError(err))
-	}
-	return nil
-}
-
-// removeChannel stops and deletes the channel; a missing channel is fine.
-func removeChannel(ctx context.Context, db *sql.DB, name string) error {
-	for _, statement := range []string{"STOP REPLICA", "RESET REPLICA ALL"} {
-		if err := channelStatement(ctx, db, statement, name); err != nil && !isServerError(err, errChannelNotExists) {
-			return fmt.Errorf("%s: %s", strings.ToLower(statement), serverError(err))
-		}
-	}
-	return nil
-}
 
 // workerError is the most recent applier worker error of the channel.
 type workerError struct {
 	Number      int
 	Message     string
 	Transaction string
-}
-
-// readWorkerError needs performance_schema; without it, it reports nothing.
-func readWorkerError(ctx context.Context, db *sql.DB, name string) (workerError, bool) {
-	var result workerError
-	err := db.QueryRowContext(ctx, workerErrorsSQL, name).Scan(&result.Number, &result.Message, &result.Transaction)
-	if err != nil {
-		return workerError{}, false
-	}
-	return result, true
-}
-
-// skipTransaction commits an empty transaction with gtid, so the applier
-// treats the failed transaction as done.
-func skipTransaction(ctx context.Context, db *sql.DB, gtid string) error {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "SET GTID_NEXT = ?", gtid); err != nil {
-		return err
-	}
-	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "SET GTID_NEXT = 'AUTOMATIC'") }()
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(ctx, "COMMIT")
-	return err
 }

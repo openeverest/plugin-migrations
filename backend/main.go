@@ -46,9 +46,10 @@ const shutdownTimeout = 15 * time.Second
 // compiledEngines lists every engine built into this binary. Configuration
 // only enables them and selects their images.
 var compiledEngines = map[string]func() engine.Engine{
-	pcsm.ID:             pcsm.New,
-	postgreslogical.ID:  postgreslogical.New,
-	mysqlreplication.ID: mysqlreplication.New,
+	pcsm.ID:                    pcsm.New,
+	postgreslogical.ID:         postgreslogical.New,
+	mysqlreplication.ID:        mysqlreplication.New,
+	mysqlreplication.MariaDBID: mysqlreplication.NewMariaDB,
 }
 
 // engineConfig is one entry of the ENGINES JSON rendered from Helm values.

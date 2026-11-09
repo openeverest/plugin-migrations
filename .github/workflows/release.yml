@@ -243,9 +243,11 @@ jobs:
             charts/plugin-migrations/values.yaml
           sed -i "s/^  tag:.*/  tag: \"${VERSION}\"/" \
             charts/plugin-migrations/values.yaml
-          # The engine worker images are released with the plugin.
-          for ENGINE in postgres-logical mysql-replication; do
-            yq -i ".engines[\"${ENGINE}\"].image.repository = \"${IMAGE}-${ENGINE}\" | .engines[\"${ENGINE}\"].image.tag = \"${VERSION}\"" \
+          # The engine worker images are released with the plugin;
+          # mariadb-replication runs the mysql-replication worker image.
+          for ENGINE in postgres-logical mysql-replication mariadb-replication; do
+            WORKER="${ENGINE/mariadb-replication/mysql-replication}"
+            yq -i ".engines[\"${ENGINE}\"].image.repository = \"${IMAGE}-${WORKER}\" | .engines[\"${ENGINE}\"].image.tag = \"${VERSION}\"" \
               charts/plugin-migrations/values.yaml
           done
 

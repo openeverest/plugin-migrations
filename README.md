@@ -8,7 +8,7 @@ keeps the target in sync with ongoing changes (**CDC**), and you trigger
 > **Status: v0.1 draft.** Engines: **MongoDB → MongoDB** built on
 > [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
 > (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication, and
-> **MySQL → MySQL** built on native GTID replication.
+> **MySQL → MySQL** and **MariaDB → MariaDB** built on native GTID replication.
 > The plugin appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
@@ -36,8 +36,9 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
 3. **Cutover**: stop writes on the source, wait for lag ≈ 0, then click
    **Cutover**. The engine finalizes the target (PCSM: indexes and other
    catalog work; PostgreSQL: sequences, materialized views, and removing the
-   replication slot and publication from the source; MySQL: waiting for the
-   source's GTID set, removing the replication channel, and enabling events).
+   replication slot and publication from the source; MySQL and MariaDB:
+   waiting for the source's GTID position, removing the replication channel,
+   and enabling events).
 4. **Delete**: removes the worker. Data on the target is kept. Engines that
    leave replication state behind (PostgreSQL) clean it up first.
 
@@ -45,7 +46,8 @@ The backend has no database. Migration records are ConfigMaps, so migrations
 survive backend restarts and upgrades. Worker progress is checkpointed by the
 engine itself (PCSM stores checkpoints in the target cluster; PostgreSQL keeps
 the replication state in the target's subscription and the source's slot;
-MySQL keeps it in the target's replication channel and GTID set).
+MySQL and MariaDB keep it in the target's replication channel and GTID
+position).
 
 ## Engines
 
@@ -54,6 +56,7 @@ MySQL keeps it in the target's replication channel and GTID set).
 | `pcsm` | MongoDB (OpenEverest `percona-server-mongodb` instance or external URI) | OpenEverest `percona-server-mongodb` instance | `percona/percona-clustersync-mongodb:1.0.0` |
 | `postgres-logical` | PostgreSQL 13+ (OpenEverest instance or external URI) | OpenEverest `percona-postgresql` instance (PostgreSQL 15+) | `ghcr.io/openeverest/plugin-migrations-postgres-logical` |
 | `mysql-replication` | MySQL 8.0+ / Percona Server / PXC (OpenEverest `percona-xtradb-cluster` instance or external URI) | OpenEverest `percona-xtradb-cluster` instance (8.0.23+) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` |
+| `mariadb-replication` | MariaDB 10.6+ (OpenEverest `mariadb` instance or external URI) | OpenEverest `mariadb` standalone or Galera instance (10.11+, provider-mariadb 0.2.2+) | same image as `mysql-replication` |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
@@ -73,6 +76,12 @@ consistent snapshot (tables, views, routines, triggers and events), then the
 changes included. Options: the databases, table excludes, *recreate the target
 databases*, and the number of copy threads. See
 [workers/mysql-replication/README.md](workers/mysql-replication/README.md).
+
+`mariadb-replication` works the same way and takes the same options; the same
+worker copies with mydumper/myloader (streamed, no disk for the data) and
+replicates over a named MariaDB replication connection
+(`MASTER_USE_GTID=slave_pos`). It connects to OpenEverest instances with the
+admin (root) connection provider-mariadb publishes.
 
 ### Adding an engine
 
@@ -106,6 +115,8 @@ Then open **Migrations** in the OpenEverest sidebar.
 | `engines.postgres-logical.image.*` | PostgreSQL worker image | `ghcr.io/openeverest/plugin-migrations-postgres-logical` (chart version) |
 | `engines.mysql-replication.enabled` | Enable the MySQL replication engine | `true` |
 | `engines.mysql-replication.image.*` | MySQL worker image | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
+| `engines.mariadb-replication.enabled` | Enable the MariaDB replication engine | `true` |
+| `engines.mariadb-replication.image.*` | MariaDB worker image (the MySQL worker image) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
@@ -164,6 +175,39 @@ MySQL (`mysql-replication`):
   databases*.
 - The source keeps binary logs on its own schedule. If the copy or a pause
   outlasts its retention, the migration fails and must be created again.
+- The source and the target must have different `server_id`s: a replica
+  ignores changes carrying its own.
+
+MariaDB (`mariadb-replication`):
+
+- Source: MariaDB 10.6+ with binary logging and `binlog_format=ROW` (MariaDB
+  defaults to `MIXED`), and a user with `REPLICATION SLAVE`, `BINLOG MONITOR`,
+  `RELOAD` and read access to the migrated databases. For an OpenEverest
+  `mariadb` source, set `binlog_format=ROW` in its configuration; standalone
+  and Galera instances also need `log_bin` (replication-topology instances
+  have it).
+- The source and the target must have different `server_id`s. OpenEverest
+  standalone and Galera instances use `server_id=1` (replication-topology
+  instances 10, 11, …), so a standalone or Galera source needs another
+  `server_id` in its configuration.
+- Target: an OpenEverest `mariadb` **standalone or Galera** instance (10.11+,
+  the same or a newer series than the source) of provider-mariadb 0.2.2 or
+  later, which starts MariaDB with `skip-slave-start` and publishes the admin
+  connection. Replication-topology targets are not supported. On Galera every
+  migrated table must be InnoDB with a primary key.
+- The **target instance** connects to the source, not only the worker pod.
+- Schema changes replicate. User accounts are not copied.
+- **Galera targets: do not create, change or drop users, roles or grants on
+  the source while the migration runs.** MariaDB applies the replication
+  filters to these statements only after Galera has already sent them to the
+  other nodes (total order isolation starts first), so they are skipped on the
+  replica node but executed on the others, and the nodes' accounts diverge.
+  An OpenEverest source runs such statements itself when its users change
+  (mariadb-operator recreates or alters them). Table and database DDL is not
+  affected, nor are standalone targets or PXC.
+- On Galera, scheduled events run only on the node that enabled them (the
+  node the migration replicated into); the other nodes show them as
+  `SLAVESIDE_DISABLED`, as for any event created on a Galera node.
 
 ## Development
 
@@ -172,7 +216,7 @@ npm install
 make frontend     # tsc + vite build (dist/main.js) + vitest
 make backend      # gofmt + go vet + go test + go build
 (cd workers/postgres-logical && go test ./...)   # PostgreSQL worker agent
-(cd workers/mysql-replication && go test ./...)  # MySQL worker agent
+(cd workers/mysql-replication && go test ./...)  # MySQL and MariaDB worker agent
 make helm-lint
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```

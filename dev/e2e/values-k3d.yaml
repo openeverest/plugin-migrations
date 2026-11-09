@@ -22,3 +22,8 @@ engines:
       repository: plugin-migrations-mysql-replication
       tag: e2e
       pullPolicy: Never
+  mariadb-replication:
+    image:
+      repository: plugin-migrations-mysql-replication
+      tag: e2e
+      pullPolicy: Never

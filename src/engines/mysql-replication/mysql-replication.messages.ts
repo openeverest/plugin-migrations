@@ -13,7 +13,7 @@ export const Messages = {
       'PEM-encoded CA the worker uses to verify the source. The target instance replicates over TLS but cannot verify the source certificate.',
   },
   uriRequired: 'Enter a connection URI.',
-  uriScheme: 'The URI must start with mysql://.',
+  uriScheme: (schemes: readonly string[]) => `The URI must start with ${schemes.join(' or ')}.`,
   uriHost: 'The URI must include a host.',
   uriMultiHost: 'Use a single host: the primary server.',
   databases: {

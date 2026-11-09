@@ -7,16 +7,26 @@ import { Messages } from './mysql-replication.messages';
 import type { MysqlReplicationOptionsDraft } from './mysql-replication.types';
 import { isValidDatabase, isValidTableName, validateMysqlReplicationOptions } from './mysql-replication.utils';
 
+interface MysqlReplicationOptionsFormProps extends EngineOptionsFormProps<MysqlReplicationOptionsDraft> {
+  /** What the engine replicates and requires; engines sharing these options differ only here. */
+  notes?: string;
+  /** A risk the user must know about before starting. */
+  warning?: string;
+}
+
 export const MysqlReplicationOptionsForm = ({
   value,
   onChange,
   disabled,
-}: EngineOptionsFormProps<MysqlReplicationOptionsDraft>) => {
+  notes = Messages.notes,
+  warning,
+}: MysqlReplicationOptionsFormProps) => {
   const errors = validateMysqlReplicationOptions(value);
 
   return (
     <Stack spacing={3}>
-      <Alert severity="info">{Messages.notes}</Alert>
+      <Alert severity="info">{notes}</Alert>
+      {warning && <Alert severity="warning">{warning}</Alert>}
       <ChipListInput
         label={Messages.databases.label}
         helperText={Messages.databases.helper}

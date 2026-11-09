@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"regexp"
 	"slices"
@@ -36,9 +37,6 @@ const (
 	caughtUpLag         = 15 * time.Second
 	cutoverPollInterval = time.Second
 	maxListedTables     = 10
-	// Target 8.0.23 has CHANGE REPLICATION SOURCE and DISABLE ON REPLICA.
-	minSourceVersion = 80000
-	minTargetVersion = 80023
 )
 
 // Phases stored in the target's state table.
@@ -56,6 +54,7 @@ var (
 
 // Config comes from the worker's environment; endpoints carry credentials.
 type Config struct {
+	Flavor            flavor
 	Source            Endpoint
 	Target            Endpoint
 	Name              string
@@ -101,8 +100,8 @@ type Agent struct {
 	failure   string
 	cancel    context.CancelFunc
 	options   Options
-	// replica is the target server the channel runs on. On PXC that is one
-	// node: the GTIDs of the copy are recorded only there.
+	// replica is the target server the channel runs on. On Galera that is
+	// one node: the GTIDs of the copy are recorded only there.
 	replica     Endpoint
 	paused      bool
 	initialSync bool
@@ -265,6 +264,7 @@ type serverInfo struct {
 	Version          string
 	Comment          string
 	UUID             string
+	ServerID         string
 	LogBin           bool
 	GTIDMode         string
 	BinlogFormat     string
@@ -280,15 +280,41 @@ func newServerInfo(variables map[string]string) serverInfo {
 		return value == "ON" || value == "1"
 	}
 	info := serverInfo{
-		Version: variables["version"], Comment: variables["version_comment"], UUID: variables["server_uuid"],
+		Version: variables["version"], Comment: variables["version_comment"], UUID: variables["server_uuid"], ServerID: variables["server_id"],
 		LogBin: on("log_bin"), GTIDMode: strings.ToUpper(variables["gtid_mode"]), BinlogFormat: strings.ToUpper(variables["binlog_format"]),
 		SkipReplicaStart: on("skip_replica_start"), LocalInfile: on("local_infile"),
 		Galera: variables["wsrep_provider"] != "" && !strings.EqualFold(variables["wsrep_provider"], "none"),
 	}
-	if address := variables["wsrep_node_incoming_address"]; info.Galera && address != "" && !strings.EqualFold(address, "AUTO") {
+	if !info.Galera {
+		return info
+	}
+	if address := variables["wsrep_node_incoming_address"]; address != "" && !strings.EqualFold(address, "AUTO") {
 		info.NodeAddress = address
+	} else if host := clusterMemberHost(variables["wsrep_cluster_address"], variables["wsrep_node_name"]); host != "" {
+		info.NodeAddress = net.JoinHostPort(host, variables["port"])
 	}
 	return info
+}
+
+// clusterMemberHost finds the node's own entry in a Galera cluster address
+// such as "gcomm://db-0.db-internal.ns.svc.cluster.local,db-1...": the
+// mariadb-operator names each member after its pod, as is wsrep_node_name.
+func clusterMemberHost(clusterAddress, nodeName string) string {
+	members, found := strings.CutPrefix(clusterAddress, "gcomm://")
+	if !found || nodeName == "" {
+		return ""
+	}
+	members, _, _ = strings.Cut(members, "?")
+	for _, member := range strings.Split(members, ",") {
+		host := strings.TrimSpace(member)
+		if withoutPort, _, err := net.SplitHostPort(host); err == nil {
+			host = withoutPort
+		}
+		if label, _, _ := strings.Cut(host, "."); label == nodeName {
+			return host
+		}
+	}
+	return ""
 }
 
 var versionPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)`)
@@ -334,7 +360,7 @@ func (a *Agent) readSource(ctx context.Context, options Options) (sourceFacts, e
 		return sourceFacts{}, err
 	}
 	facts := sourceFacts{Info: newServerInfo(variables)}
-	facts.CanReplicate = canReplicate(ctx, db)
+	facts.CanReplicate = a.config.Flavor.canReplicate(ctx, db)
 	query, args := inList(existingDatabasesSQL, options.Databases)
 	existing, err := queryStrings(ctx, db, query, args...)
 	if err != nil {
@@ -371,22 +397,6 @@ func (a *Agent) readSource(ctx context.Context, options Options) (sourceFacts, e
 	return facts, rows.Err()
 }
 
-// canReplicate probes the REPLICATION SLAVE privilege (also when granted
-// through a role): SHOW REPLICAS requires it.
-func canReplicate(ctx context.Context, db *sql.DB) bool {
-	for _, statement := range []string{"SHOW REPLICAS", "SHOW SLAVE HOSTS"} {
-		rows, err := db.QueryContext(ctx, statement)
-		if err == nil {
-			rows.Close()
-			return true
-		}
-		if !isServerError(err, errSyntax) {
-			return false
-		}
-	}
-	return false
-}
-
 func (a *Agent) readTarget(ctx context.Context, options Options) (targetFacts, error) {
 	db, err := a.target()
 	if err != nil {
@@ -401,7 +411,7 @@ func (a *Agent) readTarget(ctx context.Context, options Options) (targetFacts, e
 	if facts.Existing, err = queryStrings(ctx, db, query, args...); err != nil {
 		return targetFacts{}, err
 	}
-	channel, err := readChannel(ctx, db, a.config.Name)
+	channel, err := a.config.Flavor.readChannel(ctx, db, a.config.Name)
 	if err != nil {
 		return targetFacts{}, err
 	}
@@ -410,20 +420,10 @@ func (a *Agent) readTarget(ctx context.Context, options Options) (targetFacts, e
 }
 
 // checkPreflight lists every problem at once so they can be fixed together.
-func checkPreflight(source sourceFacts, target targetFacts, options Options) error {
-	var problems []string
-	sourceVersion, targetVersion := versionNumber(source.Info.Version), versionNumber(target.Info.Version)
-	switch {
-	case isMariaDB(source.Info):
-		problems = append(problems, "the source is MariaDB; only MySQL-compatible sources (MySQL, Percona Server, PXC) are supported")
-	case sourceVersion < minSourceVersion:
-		problems = append(problems, fmt.Sprintf("the source runs MySQL %s; version 8.0 or later is required", source.Info.Version))
-	}
+func checkPreflight(f flavor, source sourceFacts, target targetFacts, options Options) error {
+	problems := f.checkSource(source)
 	if !source.Info.LogBin {
 		problems = append(problems, "binary logging is disabled on the source; enable log_bin")
-	}
-	if source.Info.GTIDMode != "ON" {
-		problems = append(problems, fmt.Sprintf("the source has gtid_mode=%s; set gtid_mode=ON and enforce_gtid_consistency=ON", orUnknown(source.Info.GTIDMode)))
 	}
 	if source.Info.BinlogFormat != "ROW" {
 		problems = append(problems, fmt.Sprintf("the source has binlog_format=%s; set binlog_format=ROW", orUnknown(source.Info.BinlogFormat)))
@@ -435,23 +435,17 @@ func checkPreflight(source sourceFacts, target targetFacts, options Options) err
 		problems = append(problems, "databases not found on the source: "+strings.Join(source.Missing, ", "))
 	}
 	if target.Info.Galera && len(source.Unsupported) > 0 {
-		problems = append(problems, "PXC replicates only InnoDB tables with a primary key; add a primary key, convert to InnoDB or exclude: "+
+		problems = append(problems, "Galera replicates only InnoDB tables with a primary key; add a primary key, convert to InnoDB or exclude: "+
 			listNames(source.Unsupported))
 	}
-	if targetVersion < minTargetVersion {
-		problems = append(problems, fmt.Sprintf("the target runs MySQL %s; version 8.0.23 or later is required", target.Info.Version))
-	} else if targetVersion/100 < sourceVersion/100 {
-		problems = append(problems, fmt.Sprintf("the target runs MySQL %s, older than the source (%s); migrate to the same or a newer version",
-			target.Info.Version, source.Info.Version))
-	}
-	if target.Info.GTIDMode != "ON" {
-		problems = append(problems, fmt.Sprintf("the target has gtid_mode=%s; GTID mode must be ON", orUnknown(target.Info.GTIDMode)))
-	}
-	if !target.Info.SkipReplicaStart {
-		problems = append(problems, "the target must run with skip_replica_start=ON, so that a restarted server does not replicate before the migration worker restores its filters")
-	}
-	if source.Info.UUID != "" && source.Info.UUID == target.Info.UUID {
+	problems = append(problems, f.checkTarget(source, target)...)
+	switch {
+	case source.Info.UUID != "" && source.Info.UUID == target.Info.UUID:
 		problems = append(problems, "the source and the target are the same server")
+	case source.Info.ServerID != "" && source.Info.ServerID == target.Info.ServerID:
+		// A replica ignores changes that carry its own server_id.
+		problems = append(problems, fmt.Sprintf("the source and the target have the same server_id (%s); "+
+			"give the source a different server_id, or they are the same server", source.Info.ServerID))
 	}
 	if len(target.Existing) > 0 && !options.RecreateDatabases {
 		problems = append(problems, "these databases already exist on the target: "+strings.Join(target.Existing, ", ")+
@@ -493,12 +487,12 @@ func (a *Agent) prepare(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("connect to the target: %s", serverError(err))
 	}
-	if err := checkPreflight(source, target, options); err != nil {
+	if err := checkPreflight(a.config.Flavor, source, target, options); err != nil {
 		return err
 	}
 
-	// On PXC the channel and the copy's GTIDs live on one node; talk to it
-	// directly so that a proxy failover cannot split them.
+	// On Galera the channel and the copy's GTIDs live on one node; talk to
+	// it directly so that a proxy failover cannot split them.
 	replica := a.config.Target
 	if target.Info.NodeAddress != "" {
 		if replica, err = a.config.Target.WithAddress(target.Info.NodeAddress); err != nil {
@@ -509,8 +503,17 @@ func (a *Agent) prepare(ctx context.Context, options Options) error {
 	a.replica, a.bytesTotal = replica, source.DataBytes
 	a.mu.Unlock()
 
+	// originalLocalInfile is restored by a teardown during the copy; NULL
+	// when the copy leaves local_infile alone.
+	var originalLocalInfile sql.NullString
+	if a.config.Flavor.usesLocalInfile() {
+		originalLocalInfile = sql.NullString{String: "OFF", Valid: true}
+		if target.Info.LocalInfile {
+			originalLocalInfile.String = "ON"
+		}
+	}
 	a.setStep("Preparing the source and target")
-	if err := a.prepareServers(ctx, options, replica, target.Info.LocalInfile); err != nil {
+	if err := a.prepareServers(ctx, options, replica, originalLocalInfile); err != nil {
 		return err
 	}
 	policy, remapped, err := a.readDefiners(ctx, options)
@@ -519,7 +522,7 @@ func (a *Agent) prepare(ctx context.Context, options Options) error {
 	}
 
 	a.setStep("Copying data")
-	gtids, err := a.copy(ctx, options, replica, target.Info.LocalInfile, copyExclusions(remapped))
+	position, err := a.copy(ctx, options, replica, target.Info.LocalInfile, copyExclusions(remapped))
 	if err != nil {
 		return err
 	}
@@ -531,10 +534,10 @@ func (a *Agent) prepare(ctx context.Context, options Options) error {
 	}
 
 	a.setStep("Starting replication")
-	return a.startReplication(ctx, options, gtids, policy)
+	return a.startReplication(ctx, options, position, policy)
 }
 
-func (a *Agent) prepareServers(ctx context.Context, options Options, replica Endpoint, localInfile bool) error {
+func (a *Agent) prepareServers(ctx context.Context, options Options, replica Endpoint, originalLocalInfile sql.NullString) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*sqlTimeout)
 	defer cancel()
 	replicaDB, err := a.db(replica)
@@ -548,10 +551,6 @@ func (a *Agent) prepareServers(ctx context.Context, options Options, replica End
 	encodedOptions, err := json.Marshal(options)
 	if err != nil {
 		return err
-	}
-	originalLocalInfile := "OFF"
-	if localInfile {
-		originalLocalInfile = "ON"
 	}
 	for _, statement := range []struct {
 		db   *sql.DB
@@ -593,7 +592,7 @@ func (a *Agent) readDefiners(ctx context.Context, options Options) (definerPolic
 	if err != nil {
 		return definerPolicy{}, nil, err
 	}
-	policy, err := readDefinerPolicy(ctx, replicaDB)
+	policy, err := a.config.Flavor.definerPolicy(ctx, replicaDB)
 	if err != nil {
 		return definerPolicy{}, nil, fmt.Errorf("read the target's privileged accounts: %s", serverError(err))
 	}
@@ -633,7 +632,7 @@ func (a *Agent) copy(ctx context.Context, options Options, replica Endpoint, loc
 	if err != nil {
 		return "", err
 	}
-	if !localInfile {
+	if a.config.Flavor.usesLocalInfile() && !localInfile {
 		if _, err := replicaDB.ExecContext(ctx, setLocalInfileSQL, "ON"); err != nil {
 			return "", fmt.Errorf("enable local_infile on the target: %s", serverError(err))
 		}
@@ -648,7 +647,7 @@ func (a *Agent) copy(ctx context.Context, options Options, replica Endpoint, loc
 	if err := os.MkdirAll(a.config.WorkDir, 0o700); err != nil {
 		return "", fmt.Errorf("create the work directory: %w", err)
 	}
-	return runCopy(ctx, a.config.WorkDir, a.config.Source, replica, options, exclusions, func(loaded uint64) {
+	return a.config.Flavor.copy(ctx, a.config.WorkDir, a.config.Source, replica, options, exclusions, func(loaded uint64) {
 		a.mu.Lock()
 		a.bytesCopied = loaded
 		if loaded > a.bytesTotal {
@@ -658,34 +657,20 @@ func (a *Agent) copy(ctx context.Context, options Options, replica Endpoint, loc
 	})
 }
 
-func (a *Agent) startReplication(ctx context.Context, options Options, gtids string, policy definerPolicy) error {
+func (a *Agent) startReplication(ctx context.Context, options Options, position string, policy definerPolicy) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*sqlTimeout)
 	defer cancel()
 	replicaDB, err := a.replicaDB()
 	if err != nil {
 		return err
 	}
-	if err := disableCopiedEvents(ctx, replicaDB, options, policy); err != nil {
+	if err := disableCopiedEvents(ctx, replicaDB, options, a.config.Flavor.disableOnReplica(), policy); err != nil {
 		return err
 	}
-	var missing string
-	if err := replicaDB.QueryRowContext(ctx, missingGTIDsSQL, gtids).Scan(&missing); err != nil {
-		return fmt.Errorf("compare GTID sets on the target: %s", serverError(err))
+	if err := a.config.Flavor.configure(ctx, replicaDB, a.config.Name, a.config.Source, position); err != nil {
+		return err
 	}
-	if missing = strings.Join(strings.Fields(missing), ""); missing != "" {
-		if _, err := replicaDB.ExecContext(ctx, appendGTIDPurgedSQL, missing); err != nil {
-			return fmt.Errorf("record the copied transactions on the target (gtid_purged): %s", serverError(err))
-		}
-	}
-	source := a.config.Source
-	useTLS := 0
-	if source.UsesTLS() {
-		useTLS = 1
-	}
-	if _, err := replicaDB.ExecContext(ctx, changeSourceSQL, source.Host, source.Port, source.User, source.Password, useTLS, a.config.Name); err != nil {
-		return fmt.Errorf("configure replication on the target: %s", serverError(err))
-	}
-	if err := startChannel(ctx, replicaDB, a.config.Name, options); err != nil {
+	if err := startChannel(ctx, a.config.Flavor, replicaDB, a.config.Name, options); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -701,14 +686,14 @@ func (a *Agent) startReplication(ctx context.Context, options Options, gtids str
 // disableCopiedEvents keeps copied scheduled events from running on the
 // target while it replicates; replicated events arrive disabled already.
 // The cutover enables the events that are enabled on the source.
-func disableCopiedEvents(ctx context.Context, db *sql.DB, options Options, policy definerPolicy) error {
+func disableCopiedEvents(ctx context.Context, db *sql.DB, options Options, disable string, policy definerPolicy) error {
 	query, args := inList(enabledEventsSQL, options.Databases)
 	events, err := readEvents(ctx, db, query, args, false)
 	if err != nil {
 		return fmt.Errorf("list events on the target: %s", serverError(err))
 	}
 	for _, event := range events {
-		if err := alterEvent(ctx, db, event, "DISABLE ON REPLICA", policy); err != nil {
+		if err := alterEvent(ctx, db, event, disable, policy); err != nil {
 			return err
 		}
 	}
@@ -789,7 +774,7 @@ func (a *Agent) Pause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := channelStatement(ctx, db, "STOP REPLICA", a.config.Name); err != nil {
+	if err := a.config.Flavor.channel(ctx, db, a.config.Name, channelStop); err != nil {
 		return fmt.Errorf("stop replication: %s", serverError(err))
 	}
 	if _, err := db.ExecContext(ctx, setPausedSQL, true, a.config.Name); err != nil {
@@ -817,7 +802,7 @@ func (a *Agent) Resume(ctx context.Context) error {
 		return fmt.Errorf("record the resume on the target: %s", serverError(err))
 	}
 	a.paused, a.lastStart = false, time.Now()
-	return startChannel(ctx, db, a.config.Name, a.options)
+	return startChannel(ctx, a.config.Flavor, db, a.config.Name, a.options)
 }
 
 // Cutover waits, in the background, until the target applied every
@@ -838,8 +823,8 @@ func (a *Agent) Cutover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var gtids string
-	if err := sourceDB.QueryRowContext(ctx, gtidExecutedSQL).Scan(&gtids); err != nil {
+	position, err := a.config.Flavor.sourcePosition(ctx, sourceDB)
+	if err != nil {
 		return fmt.Errorf("read the source position: %s", serverError(err))
 	}
 	if a.paused {
@@ -850,7 +835,7 @@ func (a *Agent) Cutover(ctx context.Context) error {
 		if _, err := db.ExecContext(ctx, setPausedSQL, false, a.config.Name); err != nil {
 			return fmt.Errorf("record the resume on the target: %s", serverError(err))
 		}
-		if err := startChannel(ctx, db, a.config.Name, a.options); err != nil {
+		if err := startChannel(ctx, a.config.Flavor, db, a.config.Name, a.options); err != nil {
 			return err
 		}
 		a.paused = false
@@ -858,7 +843,7 @@ func (a *Agent) Cutover(ctx context.Context) error {
 	cutoverCtx, cancel := context.WithCancel(context.Background())
 	a.stage, a.cancel = stageCutover, cancel
 	go func() {
-		err := a.cutover(cutoverCtx, gtids)
+		err := a.cutover(cutoverCtx, position)
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		switch {
@@ -874,15 +859,14 @@ func (a *Agent) Cutover(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) cutover(ctx context.Context, gtids string) error {
+func (a *Agent) cutover(ctx context.Context, position string) error {
 	replicaDB, err := a.replicaDB()
 	if err != nil {
 		return err
 	}
 	for {
-		var timedOut sql.NullInt64
-		err := replicaDB.QueryRowContext(ctx, waitForGTIDsSQL, gtids, 5).Scan(&timedOut)
-		if err == nil && timedOut.Valid && timedOut.Int64 == 0 {
+		applied, err := a.config.Flavor.waitForPosition(ctx, replicaDB, position, 5)
+		if applied {
 			break
 		}
 		if err != nil {
@@ -912,14 +896,14 @@ func (a *Agent) cutover(ctx context.Context, gtids string) error {
 	if err != nil {
 		return fmt.Errorf("list events on the source: %s", serverError(err))
 	}
-	if err := removeChannel(sqlCtx, replicaDB, a.config.Name); err != nil {
+	if err := removeChannel(sqlCtx, a.config.Flavor, replicaDB, a.config.Name); err != nil {
 		return fmt.Errorf("remove the replication channel: %w", err)
 	}
 	targetEvents, err := readEvents(sqlCtx, replicaDB, query, args, true)
 	if err != nil {
 		return fmt.Errorf("list events on the target: %s", serverError(err))
 	}
-	policy, err := readDefinerPolicy(sqlCtx, replicaDB)
+	policy, err := a.config.Flavor.definerPolicy(sqlCtx, replicaDB)
 	if err != nil {
 		return fmt.Errorf("read the target's privileged accounts: %s", serverError(err))
 	}
@@ -1004,7 +988,7 @@ func (a *Agent) Teardown(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := removeChannel(ctx, db, a.config.Name); err != nil {
+	if err := removeChannel(ctx, a.config.Flavor, db, a.config.Name); err != nil {
 		return fmt.Errorf("remove the replication channel on the target: %w", err)
 	}
 	var tables int
@@ -1080,7 +1064,7 @@ func (a *Agent) superviseChannel(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	channel, err := readChannel(ctx, db, a.config.Name)
+	channel, err := a.config.Flavor.readChannel(ctx, db, a.config.Name)
 	if err != nil {
 		log.Printf("supervise: read the channel: %s", serverError(err))
 		return
@@ -1094,11 +1078,11 @@ func (a *Agent) superviseChannel(ctx context.Context) {
 		a.mu.Lock()
 		a.lastStart = time.Now()
 		a.mu.Unlock()
-		if err := startChannel(ctx, db, a.config.Name, options); err != nil {
+		if err := startChannel(ctx, a.config.Flavor, db, a.config.Name, options); err != nil {
 			log.Printf("supervise: %v", err)
 		}
 	case superviseSkip:
-		failure, ok := readWorkerError(ctx, db, a.config.Name)
+		failure, ok := a.config.Flavor.readWorkerError(ctx, db, a.config.Name, channel)
 		if !ok {
 			return
 		}
@@ -1106,15 +1090,20 @@ func (a *Agent) superviseChannel(ctx context.Context) {
 		if !skippable {
 			return
 		}
-		log.Printf("supervise: skipping transaction %s: it changes database %q, which is not migrated", failure.Transaction, database)
-		if err := channelStatement(ctx, db, "STOP REPLICA", a.config.Name); err != nil {
+		transaction := "the failed transaction"
+		if failure.Transaction != "" {
+			transaction += " " + failure.Transaction
+		}
+		log.Printf("supervise: skipping %s: it changes database %q, which is not migrated", transaction, database)
+		if err := a.config.Flavor.channel(ctx, db, a.config.Name, channelStop); err != nil {
 			log.Printf("supervise: stop replication: %s", serverError(err))
 			return
 		}
-		if err := skipTransaction(ctx, db, failure.Transaction); err != nil {
-			log.Printf("supervise: skip %s: %s", failure.Transaction, serverError(err))
+		if err := a.config.Flavor.skip(ctx, db, a.config.Name, failure); err != nil {
+			log.Printf("supervise: skip the transaction: %s", serverError(err))
+			return
 		}
-		if err := startChannel(ctx, db, a.config.Name, options); err != nil {
+		if err := startChannel(ctx, a.config.Flavor, db, a.config.Name, options); err != nil {
 			log.Printf("supervise: %v", err)
 		}
 	}
@@ -1169,11 +1158,11 @@ func (a *Agent) readSnapshot(ctx context.Context) (snapshot, error) {
 	if err != nil {
 		return snap, err
 	}
-	if snap.Channel, err = readChannel(ctx, replicaDB, a.config.Name); err != nil {
+	if snap.Channel, err = a.config.Flavor.readChannel(ctx, replicaDB, a.config.Name); err != nil {
 		return snap, fmt.Errorf("Could not read the target: %s", serverError(err))
 	}
 	if snap.Channel.SQLErrno != 0 {
-		snap.Worker, _ = readWorkerError(ctx, replicaDB, a.config.Name)
+		snap.Worker, _ = a.config.Flavor.readWorkerError(ctx, replicaDB, a.config.Name, snap.Channel)
 	}
 	var beatAt time.Time
 	if err := replicaDB.QueryRowContext(ctx, readHeartbeatSQL(a.config.Name), a.config.Name).Scan(&beatAt); err == nil {

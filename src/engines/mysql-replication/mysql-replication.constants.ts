@@ -5,7 +5,7 @@ export const MYSQL_REPLICATION_TARGET_PROVIDERS = ['percona-xtradb-cluster'];
 
 export const MYSQL_REPLICATION_SOURCE_PROVIDERS = ['percona-xtradb-cluster'];
 
-export const MYSQL_URI_SCHEME = 'mysql://';
+export const MYSQL_URI_SCHEMES = ['mysql://'];
 
 /** Stricter than MySQL: names travel through SQL, replication filters and MySQL Shell. */
 export const NAME_PATTERN = /^[A-Za-z0-9_$-]{1,64}$/;

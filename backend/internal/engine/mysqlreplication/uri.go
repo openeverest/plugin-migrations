@@ -2,17 +2,27 @@ package mysqlreplication
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/openeverest/plugin-migrations/backend/internal/engine"
 )
 
-// errInvalidURI never includes the URI because it may contain credentials.
-var errInvalidURI = errors.New("must be a mysql:// connection URI with a host")
-
 const defaultPort = "3306"
+
+// Keys provider-mariadb publishes for its admin connection.
+const (
+	propertyAdminUsername    = "admin-username"
+	propertyAdminPassword    = "admin-password"
+	propertyAdminHost        = "admin-host"
+	propertyAdminPort        = "admin-port"
+	propertyAdminTLS         = "admin-tls"
+	propertyAdminCA          = "admin-ca.crt"
+	propertySkipReplicaStart = "admin-skip-replica-start"
+)
 
 // SSL modes use MySQL client names, which the worker understands.
 const (
@@ -31,11 +41,11 @@ type mysqlURI struct {
 }
 
 // parseMySQLURI applies connection's credentials, which take precedence over
-// userinfo in the URI.
-func parseMySQLURI(raw string, connection engine.Connection) (mysqlURI, error) {
+// userinfo in the URI. Errors never include the URI: it may hold credentials.
+func parseMySQLURI(raw string, connection engine.Connection, schemes []string) (mysqlURI, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "mysql" || parsed.Hostname() == "" {
-		return mysqlURI{}, errInvalidURI
+	if err != nil || !slices.Contains(schemes, parsed.Scheme) || parsed.Hostname() == "" {
+		return mysqlURI{}, fmt.Errorf("must be a %s:// connection URI with a host", strings.Join(schemes, ":// or "))
 	}
 	if strings.Contains(parsed.Host, ",") {
 		return mysqlURI{}, errors.New("must name a single host; multi-host URIs are not supported")
@@ -98,3 +108,23 @@ func (u mysqlURI) workerURI(caPath string) (string, error) {
 
 // endpoint identifies the server, ignoring credentials and options.
 func (u mysqlURI) endpoint() string { return net.JoinHostPort(strings.ToLower(u.host), u.port) }
+
+// adminConnection is the instance's admin connection, which provider-mariadb
+// publishes next to the application user's: replication needs privileges
+// the application user does not have.
+func adminConnection(connection engine.Connection) (engine.Connection, error) {
+	properties := connection.Properties
+	host, user, password := properties[propertyAdminHost], properties[propertyAdminUsername], properties[propertyAdminPassword]
+	if host == "" || user == "" || password == "" {
+		return engine.Connection{}, errors.New("does not publish an admin connection; it needs provider-mariadb 0.2.2 or later")
+	}
+	port := properties[propertyAdminPort]
+	if port == "" {
+		port = defaultPort
+	}
+	uri := url.URL{Scheme: "mysql", Host: net.JoinHostPort(host, port), Path: "/"}
+	if properties[propertyAdminTLS] == "true" {
+		uri.RawQuery = "tls=true"
+	}
+	return engine.Connection{URI: uri.String(), Username: user, Password: password, CACert: properties[propertyAdminCA], Properties: properties}, nil
+}

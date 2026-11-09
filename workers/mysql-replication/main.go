@@ -1,7 +1,8 @@
-// Command mysql-replication-agent migrates MySQL databases into a MySQL
-// target with native replication: MySQL Shell copies the data, then the
-// target replicates from the source over a GTID channel until the cutover.
-// It exposes the HTTP API the plugin-migrations backend drives.
+// Command mysql-replication-agent migrates MySQL or MariaDB databases with
+// native replication: MySQL Shell (MySQL) or mydumper/myloader (MariaDB)
+// copies the data, then the target replicates from the source over a GTID
+// channel until the cutover. It exposes the HTTP API the plugin-migrations
+// backend drives.
 package main
 
 import (
@@ -25,6 +26,8 @@ const (
 	defaultHeartbeatInterval = 5 * time.Second
 	maxRequestBytes          = 1 << 16
 	teardownTimeout          = 2 * time.Minute
+	flavorMySQL              = "mysql"
+	flavorMariaDB            = "mariadb"
 )
 
 // channelNamePattern keeps channel names valid and unambiguous; the
@@ -50,7 +53,7 @@ func main() {
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
-	log.Printf("mysql-replication agent listening on %s (channel %s)", server.Addr, config.Name)
+	log.Printf("%s replication agent listening on %s (channel %s)", envOr("FLAVOR", flavorMySQL), server.Addr, config.Name)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve: %v", err)
 	}
@@ -71,6 +74,14 @@ func configFromEnv() (Config, error) {
 	}
 	if !channelNamePattern.MatchString(config.Name) {
 		return Config{}, errors.New("REPLICATION_NAME must be 1-54 lowercase letters, digits or underscores")
+	}
+	switch name := envOr("FLAVOR", flavorMySQL); name {
+	case flavorMySQL:
+		config.Flavor = mysqlFlavor{}
+	case flavorMariaDB:
+		config.Flavor = mariadbFlavor{targetSkipsReplicaStart: os.Getenv("TARGET_SKIP_REPLICA_START") == "true"}
+	default:
+		return Config{}, fmt.Errorf("FLAVOR must be %q or %q", flavorMySQL, flavorMariaDB)
 	}
 	if raw := os.Getenv("HEARTBEAT_INTERVAL"); raw != "" {
 		interval, err := time.ParseDuration(raw)

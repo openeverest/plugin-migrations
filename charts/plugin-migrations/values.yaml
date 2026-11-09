@@ -78,6 +78,16 @@ engines:
       repository: ghcr.io/openeverest/plugin-migrations-mysql-replication
       tag: "0.1.0"
       pullPolicy: IfNotPresent
+  # MariaDB → MariaDB (standalone and Galera targets of provider-mariadb
+  # 0.2.2+) with native GTID replication: mydumper/myloader copy the
+  # databases, then the target replicates from the source. Same worker image
+  # as mysql-replication.
+  mariadb-replication:
+    enabled: true
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-mysql-replication
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

@@ -64,6 +64,9 @@ type Connection struct {
 	Password string
 	// CACert is a PEM bundle used to verify the endpoint's TLS certificate.
 	CACert string
+	// Properties are the other keys an instance's provider publishes, such
+	// as an administrative connection. They may hold credentials.
+	Properties map[string]string
 }
 
 // PrepareInput carries resolved endpoints and the request's engine options in

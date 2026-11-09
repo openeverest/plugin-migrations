@@ -26,8 +26,9 @@ const (
 )
 
 // planSupervision decides how to keep a channel that should be running
-// healthy. A restarted server (skip_replica_start) leaves the channel stopped
-// and without filters; filters must be in place before it starts again.
+// healthy. A restarted server (skip_replica_start / skip-slave-start) leaves
+// the channel stopped and without filters; filters must be in place before
+// it starts again.
 func planSupervision(channel channelState, options Options, name string, sinceLastStart time.Duration) supervision {
 	if !channel.Exists || sinceLastStart < startInterval {
 		return superviseNothing
@@ -56,7 +57,7 @@ var unknownDatabasePattern = regexp.MustCompile(`Unknown database '([^']+)'`)
 // way; this is DDL such as CREATE PROCEDURE other.p, which passes the table
 // filters because it touches no table.
 func skippableDatabase(failure workerError, options Options) (string, bool) {
-	if failure.Number != errUnknownDatabase || failure.Transaction == "" {
+	if failure.Number != errUnknownDatabase {
 		return "", false
 	}
 	match := unknownDatabasePattern.FindStringSubmatch(failure.Message)

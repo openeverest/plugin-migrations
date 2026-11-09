@@ -39,6 +39,12 @@ export const Messages = {
     heading: 'Where should the data go?',
     instanceLabel: 'Target instance',
     required: 'Select a target instance.',
+    backupStorageLabel: 'Backup storage',
+    backupStorageHelper:
+      "S3 storage in the target's namespace that holds the backups during the migration. The source and target SQL Servers must trust its TLS certificate: attach it to OpenEverest instances.",
+    backupStorageRequired: 'Select a backup storage.',
+    noBackupStorages: "No backup storages in the target's namespace. Create one in OpenEverest first.",
+    backupStorageError: (message: string) => `Could not load backup storages: ${message}`,
   },
   noInstances: 'No compatible instances are available in this cluster.',
   options: {
@@ -56,5 +62,6 @@ export const Messages = {
     caProvided: 'Provided',
     caNotProvided: 'Not provided',
     target: 'Target',
+    backupStorage: 'Backup storage',
   },
 };

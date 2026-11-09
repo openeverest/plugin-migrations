@@ -1,0 +1,33 @@
+{{- /*
+Engines that stage data in an OpenEverest BackupStorage need its credentials,
+which the OpenEverest API does not return. The backend reads the storage with
+the caller's JWT (proving access) and then only the Secret that storage names.
+*/}}
+{{- $mssql := index .Values.engines "mssql-log-shipping" | default dict }}
+{{- if $mssql.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "plugin-migrations.fullname" . }}-backup-storage-credentials
+  labels:
+    {{- include "plugin-migrations.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "plugin-migrations.fullname" . }}-backup-storage-credentials
+  labels:
+    {{- include "plugin-migrations.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "plugin-migrations.fullname" . }}
+    namespace: {{ .Release.Namespace | quote }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "plugin-migrations.fullname" . }}-backup-storage-credentials
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

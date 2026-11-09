@@ -32,3 +32,8 @@ engines:
       repository: plugin-migrations-redis-shake
       tag: e2e
       pullPolicy: Never
+  mssql-log-shipping:
+    image:
+      repository: plugin-migrations-mssql-log-shipping
+      tag: e2e
+      pullPolicy: Never

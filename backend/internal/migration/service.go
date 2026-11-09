@@ -33,6 +33,7 @@ type Service struct {
 	store     Store
 	workloads Workloads
 	everest   Everest
+	secrets   Secrets
 	now       func() time.Time
 	newID     func() string
 
@@ -42,9 +43,9 @@ type Service struct {
 	cache    map[string]observation
 }
 
-func NewService(registry *engine.Registry, store Store, workloads Workloads, everestAPI Everest) *Service {
+func NewService(registry *engine.Registry, store Store, workloads Workloads, everestAPI Everest, secrets Secrets) *Service {
 	return &Service{
-		registry: registry, store: store, workloads: workloads, everest: everestAPI,
+		registry: registry, store: store, workloads: workloads, everest: everestAPI, secrets: secrets,
 		now: time.Now, newID: randomID, cache: map[string]observation{},
 	}
 }
@@ -104,6 +105,22 @@ func (s *Service) Create(ctx context.Context, token string, request CreateReques
 	if !slices.Contains(registration.Engine.Describe().TargetProviders, target.Provider) {
 		return View{}, newError(KindInvalid, "engine does not support the target instance's provider")
 	}
+	var (
+		storageRef *BackupStorageRef
+		storage    *engine.BackupStorage
+	)
+	switch {
+	case registration.Engine.Describe().RequiresBackupStorage:
+		if request.BackupStorage == nil || strings.TrimSpace(request.BackupStorage.Name) == "" {
+			return View{}, newError(KindInvalid, "choose a backup storage")
+		}
+		storageRef = &BackupStorageRef{Namespace: target.Namespace, Name: strings.TrimSpace(request.BackupStorage.Name)}
+		if storage, err = s.resolveBackupStorage(ctx, token, target.K8sCluster, *storageRef); err != nil {
+			return View{}, err
+		}
+	case request.BackupStorage != nil:
+		return View{}, newError(KindInvalid, "this engine does not use a backup storage")
+	}
 
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
@@ -115,6 +132,7 @@ func (s *Service) Create(ctx context.Context, token string, request CreateReques
 	prepared, err := registration.Engine.Prepare(engine.PrepareInput{
 		MigrationID: id, Source: sourceInfo, Target: targetInfo,
 		SourceConn: sourceConn, TargetConn: targetConn, Options: request.Options, Runner: registration.Runner,
+		BackupStorage: storage,
 	})
 	if err != nil {
 		return View{}, err
@@ -125,7 +143,7 @@ func (s *Service) Create(ctx context.Context, token string, request CreateReques
 
 	record, err := s.store.Create(ctx, Record{
 		ID: id, Name: request.Name, Engine: request.Engine, Source: source, Target: target,
-		Options: prepared.Snapshot, WorkerPort: prepared.Worker.Port, CreatedAt: s.now().UTC(),
+		Options: prepared.Snapshot, WorkerPort: prepared.Worker.Port, CreatedAt: s.now().UTC(), BackupStorage: storageRef,
 	})
 	if err != nil {
 		return View{}, err
@@ -205,6 +223,44 @@ func (s *Service) resolveInstance(ctx context.Context, token string, request End
 	connection := engine.Connection{URI: details.URI, Username: details.Username, Password: details.Password, CACert: details.CACert,
 		Properties: details.Properties}
 	return endpoint, connection, nil
+}
+
+// resolveBackupStorage reads the storage with the caller's JWT, which proves
+// the caller may read it, then its credentials Secret with the plugin's
+// ServiceAccount: the OpenEverest API does not return credentials. The
+// Secret's name comes from the storage, never from the request.
+func (s *Service) resolveBackupStorage(ctx context.Context, token, k8sCluster string, ref BackupStorageRef) (*engine.BackupStorage, error) {
+	spec, err := s.everest.GetBackupStorage(ctx, token, everest.BackupStorageRef{K8sCluster: k8sCluster, Namespace: ref.Namespace, Name: ref.Name})
+	if errors.Is(err, everest.ErrNotFound) {
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s/%s not found", ref.Namespace, ref.Name))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if spec.Type != "s3" || spec.S3 == nil || spec.S3.CredentialsSecretRef.Name == "" {
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s must be an S3 storage with credentials", ref.Name))
+	}
+	if s.secrets == nil {
+		return nil, newError(KindUnavailable, "the plugin cannot read backup storage credentials")
+	}
+	data, err := s.secrets.ReadSecret(ctx, ref.Namespace, spec.S3.CredentialsSecretRef.Name)
+	if err != nil {
+		log.Printf("read the credentials of backup storage %s/%s: %v", ref.Namespace, ref.Name, err)
+		return nil, newError(KindUnavailable, fmt.Sprintf("could not read the credentials of backup storage %s", ref.Name))
+	}
+	storage := &engine.BackupStorage{
+		Namespace: ref.Namespace, Name: ref.Name,
+		EndpointURL: spec.S3.EndpointURL, Bucket: spec.S3.Bucket, Region: spec.S3.Region,
+		ForcePathStyle:  spec.S3.ForcePathStyle != nil && *spec.S3.ForcePathStyle,
+		VerifyTLS:       spec.S3.VerifyTLS == nil || *spec.S3.VerifyTLS,
+		AccessKeyID:     string(data["AWS_ACCESS_KEY_ID"]),
+		SecretAccessKey: string(data["AWS_SECRET_ACCESS_KEY"]),
+		CACert:          string(data["ca.crt"]),
+	}
+	if storage.AccessKeyID == "" || storage.SecretAccessKey == "" {
+		return nil, newError(KindInvalid, fmt.Sprintf("the credentials Secret of backup storage %s lacks AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY", ref.Name))
+	}
+	return storage, nil
 }
 
 // ensureTargetIsFree allows one migration per target, completed or not. PCSM

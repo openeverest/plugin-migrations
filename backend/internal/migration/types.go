@@ -56,8 +56,17 @@ type Record struct {
 	CreatedAt          time.Time       `json:"createdAt"`
 	StartedAt          *time.Time      `json:"startedAt,omitempty"`
 	CutoverRequestedAt *time.Time      `json:"cutoverRequestedAt,omitempty"`
+	// BackupStorage is the staging storage of engines that require one.
+	BackupStorage *BackupStorageRef `json:"backupStorage,omitempty"`
 	// ResourceVersion enables optimistic concurrency; it is not serialized.
 	ResourceVersion string `json:"-"`
+}
+
+// BackupStorageRef names an OpenEverest BackupStorage. It lives in the
+// target's Kubernetes cluster and namespace.
+type BackupStorageRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
 }
 
 // Store persists records. Update must fail with KindConflict when the record's
@@ -93,6 +102,13 @@ type WorkerState struct {
 type Everest interface {
 	GetConnection(ctx context.Context, token string, ref everest.InstanceRef) (everest.ConnectionDetails, error)
 	CheckAccess(ctx context.Context, token string, ref everest.InstanceRef) error
+	GetBackupStorage(ctx context.Context, token string, ref everest.BackupStorageRef) (everest.BackupStorageSpec, error)
+}
+
+// Secrets reads Secrets with the plugin's own ServiceAccount. The service
+// reads only Secrets that a resource the caller may read names.
+type Secrets interface {
+	ReadSecret(ctx context.Context, namespace, name string) (map[string][]byte, error)
 }
 
 // EndpointRequest is the API input for a source or target.
@@ -111,6 +127,13 @@ type CreateRequest struct {
 	Source  EndpointRequest `json:"source"`
 	Target  EndpointRequest `json:"target"`
 	Options json.RawMessage `json:"options"`
+	// BackupStorage names a BackupStorage in the target's namespace, for
+	// engines that stage data in object storage.
+	BackupStorage *BackupStorageRequest `json:"backupStorage,omitempty"`
+}
+
+type BackupStorageRequest struct {
+	Name string `json:"name"`
 }
 
 // EndpointView is the API representation of an endpoint.
@@ -125,20 +148,21 @@ type EndpointView struct {
 
 // View is the API representation of a migration (docs/architecture.md §8).
 type View struct {
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	Engine         string          `json:"engine"`
-	Source         EndpointView    `json:"source"`
-	Target         EndpointView    `json:"target"`
-	Options        json.RawMessage `json:"options"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	StartedAt      *time.Time      `json:"startedAt,omitempty"`
-	Phase          engine.Phase    `json:"phase"`
-	Message        string          `json:"message"`
-	Error          string          `json:"error"`
-	Progress       engine.Progress `json:"progress"`
-	ObservedAt     *time.Time      `json:"observedAt,omitempty"`
-	AllowedActions []Action        `json:"allowedActions"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Engine         string            `json:"engine"`
+	Source         EndpointView      `json:"source"`
+	Target         EndpointView      `json:"target"`
+	Options        json.RawMessage   `json:"options"`
+	BackupStorage  *BackupStorageRef `json:"backupStorage,omitempty"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	StartedAt      *time.Time        `json:"startedAt,omitempty"`
+	Phase          engine.Phase      `json:"phase"`
+	Message        string            `json:"message"`
+	Error          string            `json:"error"`
+	Progress       engine.Progress   `json:"progress"`
+	ObservedAt     *time.Time        `json:"observedAt,omitempty"`
+	AllowedActions []Action          `json:"allowedActions"`
 }
 
 func endpointView(endpoint Endpoint) EndpointView {
@@ -162,7 +186,7 @@ func newView(record Record, observed observation) View {
 	view := View{
 		ID: record.ID, Name: record.Name, Engine: record.Engine,
 		Source: endpointView(record.Source), Target: endpointView(record.Target),
-		Options: record.Options, CreatedAt: record.CreatedAt, StartedAt: record.StartedAt,
+		Options: record.Options, BackupStorage: record.BackupStorage, CreatedAt: record.CreatedAt, StartedAt: record.StartedAt,
 		Phase: observed.status.Phase, Message: observed.status.Message, Error: observed.status.Error,
 		Progress: observed.status.Progress, AllowedActions: allowedActions(observed),
 	}

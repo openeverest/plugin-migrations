@@ -135,6 +135,83 @@ func (c *Client) CheckAccess(ctx context.Context, token string, ref InstanceRef)
 	return c.getJSON(ctx, token, instancePath(ref), &ignored)
 }
 
+// BackupStorageRef identifies an OpenEverest BackupStorage.
+type BackupStorageRef struct {
+	K8sCluster string
+	Namespace  string
+	Name       string
+}
+
+// BackupStorageSpec is the credential-free S3 configuration of a
+// BackupStorage. Credentials live in the Secret it names.
+type BackupStorageSpec struct {
+	Type string           `json:"type"`
+	S3   *BackupStorageS3 `json:"s3"`
+}
+
+type BackupStorageS3 struct {
+	Bucket               string    `json:"bucket"`
+	Region               string    `json:"region"`
+	EndpointURL          string    `json:"endpointURL"`
+	VerifyTLS            *bool     `json:"verifyTLS"`
+	ForcePathStyle       *bool     `json:"forcePathStyle"`
+	CredentialsSecretRef SecretRef `json:"credentialsSecretRef"`
+}
+
+type SecretRef struct {
+	Name string `json:"name"`
+}
+
+// BackupStorageSummary is credential-free backup storage metadata for pickers.
+type BackupStorageSummary struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Bucket   string `json:"bucket"`
+	Endpoint string `json:"endpointURL"`
+}
+
+// ListBackupStorages returns the storages the caller can read in a namespace.
+func (c *Client) ListBackupStorages(ctx context.Context, token, k8sCluster, namespace string) ([]BackupStorageSummary, error) {
+	var listed struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec BackupStorageSpec `json:"spec"`
+		} `json:"items"`
+	}
+	path := fmt.Sprintf("/v1/clusters/%s/namespaces/%s/backup-storages", url.PathEscape(k8sCluster), url.PathEscape(namespace))
+	if err := c.getJSON(ctx, token, path, &listed); err != nil {
+		return nil, err
+	}
+	storages := make([]BackupStorageSummary, 0, len(listed.Items))
+	for _, item := range listed.Items {
+		if item.Metadata.Name == "" {
+			continue
+		}
+		summary := BackupStorageSummary{Name: item.Metadata.Name, Type: item.Spec.Type}
+		if item.Spec.S3 != nil {
+			summary.Bucket, summary.Endpoint = item.Spec.S3.Bucket, item.Spec.S3.EndpointURL
+		}
+		storages = append(storages, summary)
+	}
+	slices.SortFunc(storages, func(a, b BackupStorageSummary) int { return strings.Compare(a.Name, b.Name) })
+	return storages, nil
+}
+
+// GetBackupStorage requires the caller's read permission on the storage.
+func (c *Client) GetBackupStorage(ctx context.Context, token string, ref BackupStorageRef) (BackupStorageSpec, error) {
+	var storage struct {
+		Spec BackupStorageSpec `json:"spec"`
+	}
+	path := fmt.Sprintf("/v1/clusters/%s/namespaces/%s/backup-storages/%s",
+		url.PathEscape(ref.K8sCluster), url.PathEscape(ref.Namespace), url.PathEscape(ref.Name))
+	if err := c.getJSON(ctx, token, path, &storage); err != nil {
+		return BackupStorageSpec{}, err
+	}
+	return storage.Spec, nil
+}
+
 type listedInstance struct {
 	Metadata struct {
 		Name string `json:"name"`

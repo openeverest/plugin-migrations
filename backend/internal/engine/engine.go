@@ -51,6 +51,9 @@ type Descriptor struct {
 	// CanPause tells whether a running migration can be paused and resumed
 	// where it stopped.
 	CanPause bool `json:"canPause"`
+	// RequiresBackupStorage makes a migration name an OpenEverest
+	// BackupStorage in the target's namespace, which the engine stages data in.
+	RequiresBackupStorage bool `json:"requiresBackupStorage"`
 }
 
 // EndpointInfo is what an engine needs to decide compatibility.
@@ -82,6 +85,24 @@ type PrepareInput struct {
 	TargetConn  Connection
 	Options     json.RawMessage
 	Runner      RunnerConfig
+	// BackupStorage is set for engines whose descriptor requires one.
+	BackupStorage *BackupStorage
+}
+
+// BackupStorage is a resolved OpenEverest S3 BackupStorage. Never log it.
+type BackupStorage struct {
+	Namespace       string
+	Name            string
+	EndpointURL     string
+	Bucket          string
+	Region          string
+	ForcePathStyle  bool
+	VerifyTLS       bool
+	AccessKeyID     string
+	SecretAccessKey string
+	// CACert is the optional ca.crt of the credentials Secret, which
+	// providers mount into database pods to trust a private CA.
+	CACert string
 }
 
 // RunnerConfig comes from trusted deployment configuration, never a request.

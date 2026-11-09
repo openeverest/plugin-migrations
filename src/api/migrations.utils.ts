@@ -48,6 +48,10 @@ export function parseMigration(value: unknown): Migration | undefined {
   if (!id || !name || !engine || createdAt === undefined || !source || !target) return undefined;
   const startedAt = readString(value, 'startedAt');
   const observedAt = readString(value, 'observedAt');
+  const storage = readRecord(value, 'backupStorage');
+  const storageName = storage && readString(storage, 'name');
+  const backupStorage =
+    storage && storageName ? { namespace: readString(storage, 'namespace') ?? '', name: storageName } : undefined;
   return {
     id,
     name,
@@ -55,6 +59,7 @@ export function parseMigration(value: unknown): Migration | undefined {
     source,
     target,
     options: readRecord(value, 'options') ?? {},
+    ...(backupStorage ? { backupStorage } : {}),
     createdAt,
     ...(startedAt ? { startedAt } : {}),
     // A phase newer than this UI is shown as unknown rather than dropping the migration.

@@ -10,6 +10,10 @@ backend/dist/*
 !backend/dist/icon.svg
 /backend/backend
 /backend/server
+/workers/*/postgres-logical
+/workers/*/mysql-replication
+/workers/*/redis-shake
+/workers/*/mssql-log-shipping
 
 # IDE
 .idea/

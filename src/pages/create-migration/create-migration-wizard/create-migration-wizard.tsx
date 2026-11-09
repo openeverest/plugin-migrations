@@ -4,7 +4,7 @@ import type { Migration } from '../../../api/migrations.types';
 import type { Engine } from '../../../engines/engine.types';
 import { WIZARD_STEPS } from '../create-migration.constants';
 import { Messages } from '../create-migration.messages';
-import { buildReviewOptions, buildReviewSummary } from '../create-migration.utils';
+import { buildReviewOptions, buildReviewSummary, findTargetInstance } from '../create-migration.utils';
 import { EngineStep } from '../engine-step/engine-step';
 import { OptionsStep } from '../options-step/options-step';
 import { ReviewStep } from '../review-step/review-step';
@@ -58,7 +58,16 @@ export const CreateMigrationWizard = ({ engines, instances, onCreated, onCancel 
           <TargetStep
             instances={context.targetInstances}
             value={draft.targetInstanceKey}
-            onChange={(targetInstanceKey) => wizard.updateDraft({ targetInstanceKey })}
+            onChange={wizard.chooseTargetInstance}
+            backupStorage={
+              engine?.requiresBackupStorage
+                ? {
+                    target: findTargetInstance(draft, context),
+                    value: draft.backupStorageName,
+                    onChange: (backupStorageName) => wizard.updateDraft({ backupStorageName }),
+                  }
+                : undefined
+            }
           />
         )}
         {step === 'options' && engine && (

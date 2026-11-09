@@ -24,6 +24,7 @@ import (
 
 	"github.com/openeverest/plugin-migrations/backend/internal/api"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine"
+	"github.com/openeverest/plugin-migrations/backend/internal/engine/mssqllogshipping"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/mysqlreplication"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/pcsm"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/postgreslogical"
@@ -52,6 +53,7 @@ var compiledEngines = map[string]func() engine.Engine{
 	mysqlreplication.ID:        mysqlreplication.New,
 	mysqlreplication.MariaDBID: mysqlreplication.NewMariaDB,
 	redisshake.ID:              redisshake.New,
+	mssqllogshipping.ID:        mssqllogshipping.New,
 }
 
 // engineConfig is one entry of the ENGINES JSON rendered from Helm values.
@@ -166,7 +168,8 @@ func run() error {
 	}
 
 	everestClient := everest.NewClient(everest.APIURLFromEnv())
-	service := migration.NewService(registry, kube.NewStore(clientset, namespace), kube.NewWorkloads(clientset, namespace, workerConfig), everestClient)
+	service := migration.NewService(registry, kube.NewStore(clientset, namespace), kube.NewWorkloads(clientset, namespace, workerConfig), everestClient,
+		kube.NewSecretReader(clientset))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -16,9 +16,11 @@ built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
 (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication
 (`postgres-logical`), **MySQL → MySQL** and **MariaDB → MariaDB** built on
-native GTID replication (`mysql-replication`, `mariadb-replication`), and
+native GTID replication (`mysql-replication`, `mariadb-replication`),
 **Redis / Valkey → Valkey** built on
-[RedisShake](https://github.com/tair-opensource/RedisShake) (`redis-shake`).
+[RedisShake](https://github.com/tair-opensource/RedisShake) (`redis-shake`),
+and **SQL Server → SQL Server** built on log shipping through S3
+(`mssql-log-shipping`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -78,9 +80,10 @@ Backend layers (Go, `backend/internal/...`):
 | `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), teardown. | `engine`, `engine/agentclient` |
 | `engine/mysqlreplication` | MySQL and MariaDB engines (one worker image, `FLAVOR` env): option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files; provider-mariadb admin connections), teardown. | `engine`, `engine/agentclient` |
 | `engine/redisshake` | Redis/Valkey engine: option validation, worker spec (redis[s]:// URIs, CA and provider-valkey client certificate files), teardown. Declares `CanPause: false`. | `engine`, `engine/agentclient` |
-| `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
-| `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
-| `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
+| `engine/mssqllogshipping` | SQL Server engine: option validation, worker spec (sqlserver:// URIs, CA files, the BackupStorage's endpoint, credentials and CA), teardown. Declares `RequiresBackupStorage`. | `engine`, `engine/agentclient` |
+| `migration` | Domain service: create/list/get/act/delete, authorization, endpoint and backup storage resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest`/`Secrets` interfaces |
+| `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record; reads a BackupStorage's credentials Secret. | Kubernetes, `migration` types |
+| `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details, backup storages). | HTTP |
 | `api` | HTTP handlers, request decoding, error mapping. | `migration` |
 
 The frontend (`src/`) mirrors the backend. A frontend **engine registry**
@@ -94,7 +97,7 @@ know about specific engines.
 // engine.Engine: pure, no I/O. Shared across requests.
 type Engine interface {
     ID() string                                     // "pcsm"
-    Describe() Descriptor                           // display name, source/target DB types, target providers, CanPause
+    Describe() Descriptor                           // display name, source/target DB types, target providers, CanPause, RequiresBackupStorage
     Supports(source, target EndpointInfo) bool      // database type compatibility
     Prepare(PrepareInput) (Prepared, error)         // validate options → WorkerSpec + safe options snapshot
     Controller(baseURL string) Controller           // client for a running worker
@@ -117,8 +120,11 @@ type Teardowner interface {
 ```
 
 `Prepare` receives the resolved endpoint connections (URI, username, password,
-CA) and trusted runner configuration (image and pull policy from Helm). It
-returns:
+CA) and trusted runner configuration (image and pull policy from Helm). An
+engine whose descriptor sets `RequiresBackupStorage` also receives the
+BackupStorage the user picked in the target's namespace, with its S3
+endpoint, bucket, region, addressing style, credentials and optional CA
+(`engine.BackupStorage`). It returns:
 
 - `WorkerSpec`: container port, health path, env, secret data, secret env and
   secret files (TLS CAs). Credentials appear only in the secret fields.
@@ -200,6 +206,15 @@ less. RedisShake cannot resume a run: when it stops on a lost connection or a
 restart, the worker empties the target and copies again from the beginning,
 and the phase goes back to `full-load` with the reason in the message.
 
+`mssql-log-shipping` uses the same agent states. `full-load` covers the
+preflight and, per database, the full backup and its restore `WITH
+NORECOVERY` (progress from the data file sizes and the backup's and
+restore's `percent_complete`); then `catching-up` until every database
+restored a log backup and the lag is 15s or less. The lag is the age, on the
+source's clock, of the start of the oldest database's last restored backup.
+A failing backup or restore is retried with the error in the status; a broken
+log chain fails the migration for good.
+
 ### Allowed actions
 
 The backend computes `allowedActions` so the UI does not duplicate engine rules.
@@ -253,10 +268,18 @@ it later (for GitOps) without changing the domain service.
       `GET /v1/clusters/{c}/namespaces/{ns}/instances/{name}/connection` with
       the **caller's JWT**, which also proves `read-connection` permission.
       External sources use the URI from the request.
-   3. Reject a target that already has a migration record, whatever its phase,
+   3. For engines that require one, resolve the **backup storage** named in
+      the request, in the target's namespace:
+      `GET /v1/clusters/{c}/namespaces/{ns}/backup-storages/{name}` with the
+      caller's JWT proves the caller can read it and returns its S3 settings;
+      the backend then reads the credentials Secret that storage names
+      (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `ca.crt`) with
+      its ServiceAccount, because the API never returns credentials. The
+      Secret's name comes from the storage, never from the request.
+   4. Reject a target that already has a migration record, whatever its phase,
       or a worker pod still shutting down (see §11, "One migration per
       target"). Users delete the previous migration first.
-   4. `engine.Prepare`, then create the ConfigMap and the owned Secret,
+   5. `engine.Prepare`, then create the ConfigMap and the owned Secret,
       Deployment and Service. Engines can add a one-shot **bootstrap** Job;
       the Deployment then starts at zero replicas and the reconciler scales it
       to one after the Job succeeds, so worker restarts never re-run it. PCSM
@@ -272,7 +295,9 @@ it later (for GitOps) without changing the domain service.
 4. **Delete**: if the engine's controller is a `Teardowner` and the migration
    was started, call `Teardown` first (PostgreSQL: drop the subscription, the
    source slot and publication, and the heartbeat tables; MySQL: remove the
-   replication channel and the `openeverest_migration` databases). A failed teardown
+   replication channel and the `openeverest_migration` databases; SQL
+   Server: drop the S3 credentials, the bucket's objects and the state
+   tables). A failed teardown
    returns 502 and keeps the record, so nothing is left retaining WAL
    silently; `?force=true` skips it when the source no longer exists. Then
    delete the ConfigMap. The worker stops and data already written to the
@@ -291,6 +316,10 @@ it later (for GitOps) without changing the domain service.
   a stronger permission than reading.
 - The backend ServiceAccount is limited to ConfigMaps, Secrets, Services,
   Deployments, bootstrap Jobs and listing Pods in the workload namespace.
+  When `mssql-log-shipping` is enabled it may also `get` Secrets in any
+  namespace (a ClusterRole), to read the credentials of the BackupStorage a
+  user picked after the OpenEverest API confirmed the user can read that
+  storage. The credentials go only into the migration's Secret.
 - Workers run as non-root with a restricted security context. A
   NetworkPolicy can restrict worker ingress to the plugin backend (roadmap).
 
@@ -315,7 +344,8 @@ upstream or worker failure).
       "sourceDatabaseTypes": ["mongodb"],
       "targetDatabaseTypes": ["mongodb"],
       "targetProviders": ["percona-server-mongodb"],
-      "canPause": true
+      "canPause": true,
+      "requiresBackupStorage": false
     }
   ]
 }
@@ -328,6 +358,15 @@ pickers. The response matches plugin-bench:
 
 ```json
 { "instances": [ { "k8sCluster": "main", "namespace": "shop", "name": "orders", "provider": "percona-server-mongodb" } ] }
+```
+
+### `GET /api/backup-storages?k8sCluster=main&namespace=shop`
+
+The backup storages the caller can read in a namespace, for engines that
+require one (the target's namespace). No credentials:
+
+```json
+{ "backupStorages": [ { "name": "s3-eu", "type": "s3", "bucket": "backups", "endpointURL": "https://s3.eu-west-1.amazonaws.com" } ] }
 ```
 
 ### `GET /api/migrations`
@@ -348,7 +387,9 @@ migrations the caller may see.
 ```
 
 `source` can also be `{ "type": "instance", "k8sCluster", "namespace", "name" }`.
-The response is `201` with a `Migration`.
+Engines whose descriptor sets `requiresBackupStorage` need
+`"backupStorage": { "name": "s3-eu" }`, a BackupStorage in the target's
+namespace; other engines reject it. The response is `201` with a `Migration`.
 
 ### `GET /api/migrations/{id}`
 
@@ -396,7 +437,9 @@ cleanup; the UI offers it as **Delete anyway** after a failed delete.
 Phases: `provisioning`, `starting`, `full-load`, `catching-up`, `replicating`,
 `paused`, `finalizing`, `completed`, `failed`, `unknown`.
 `startedAt`, `observedAt` and `progress.lastReplicatedAt` may be omitted when
-unknown. `source.display` is set only for external sources.
+unknown. `source.display` is set only for external sources. Migrations of
+engines that use a backup storage include `"backupStorage": { "namespace",
+"name" }`.
 
 ### PCSM engine options (`engine: "pcsm"`)
 
@@ -524,6 +567,55 @@ mode, also for its `replication` topology). The worker:
   the source keeps taking writes. It then stops RedisShake and removes the
   heartbeat keys on both sides.
 
+### SQL Server engine options (`engine: "mssql-log-shipping"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `databases` | `string[]` (≤ 50) | database in the source URI (`?database=`) | Required for instance sources. Databases keep their names on the target. System databases cannot be migrated. |
+| `recreateDatabases` | `bool` | `false` | Drop the databases on the target first. Otherwise an existing database fails the preflight. |
+| `copyLogins` | `bool` | `true` | At the cutover, create the SQL logins of the databases' users and owners on the target (every replica of an availability group), with the same SID and password hash. |
+| `leaveSourceRestoring` | `bool` | `false` | Take the cutover's tail-log backup `WITH NORECOVERY`: the source databases stay restoring and take no more writes. Refused for databases in an availability group. |
+| `ignoreRecentLogBackups` | `bool` | `false` | Skip the preflight check for log backups taken outside the migration in the last 24 hours, once they are disabled. |
+| `logBackupIntervalSeconds` | `int` (5–300) | `10` | How often each database gets a log backup that is restored at once. |
+
+The request also names a `backupStorage`. Only `mssql` targets are offered:
+provider-mssql publishes `sa`. Both servers need SQL Server 2022+ (S3 backup
+URLs) and the target must not be older than the source. The worker:
+
+- **Preflight**: versions, `sysadmin` on both sides, different servers, the
+  databases online and in the FULL recovery model, TDE certificates on the
+  target, the target databases absent (or `recreateDatabases`), no foreign
+  log backups in the last 24 hours, and both servers reading a probe object
+  from the storage with the migration's credential (they must trust its TLS
+  certificate). The credential is named after the migration's prefix
+  (`s3://…/<bucket>/openeverest-migrations/<id>`), the longest prefix, so the
+  operator's bucket-wide credential is never used.
+- **Copy**: a `COPY_ONLY` full backup (a regular one when the database never
+  had a full backup, which starts its log chain) restored `WITH NORECOVERY`,
+  files moved to the target's default paths.
+- **Log shipping**: one log backup per database every interval, restored at
+  once. A log backup in `msdb` that is not the migration's and is newer than
+  the last restored LSN, or a backup that starts past it, fails the migration
+  (the chain is broken). Restored backups are deleted from the bucket.
+- **State**: `master.dbo.openeverest_migration*` on the target replica the
+  databases are restored on (master, because the operator adopts every
+  online user database into an availability group). It records each
+  database's last backup and whether it was restored, so a restarted worker
+  restores what it took, adopts a backup it took but did not record, and
+  never drops a database after the preflight. Failures are kept there too.
+- **Cutover**: a final log backup per database, started after the request
+  (so it holds everything committed before it), is restored; then the
+  databases are recovered (`WITH RECOVERY`, and `MULTI_USER` again after a
+  tail-log backup) and the logins copied. On an availability group target
+  the operator then adds the databases to the group and seeds the
+  secondaries.
+- **Availability groups**: credentials are server objects, so each cycle
+  creates the migration's credential where it is missing (a source fails
+  over to a replica without one), and cleanup drops it on every replica.
+  When the target replica the databases are restored on becomes a
+  secondary, the worker moves to the new primary and copies the databases
+  again, unless the cutover's final backups were taken.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -535,7 +627,8 @@ mode, also for its `replication` topology). The worker:
      registry.
   2. **Source**: choose *OpenEverest instance* (picker filtered to the engine's
      providers) or *External* (URI and an optional CA).
-  3. **Target**: an OpenEverest instance (excluding the source).
+  3. **Target**: an OpenEverest instance (excluding the source), and a backup
+     storage in its namespace for engines that require one.
   4. **Options**: the engine's options form (namespace filters, pause on initial
      sync, an *Advanced* section with tuning).
   5. **Review**, then create.
@@ -560,12 +653,17 @@ mode, also for its `replication` topology). The worker:
 - `engines.redis-shake.enabled` and `engines.redis-shake.image`
   (`ghcr.io/openeverest/plugin-migrations-redis-shake`, with RedisShake 4.7.0,
   released with the plugin).
+- `engines.mssql-log-shipping.enabled` and `engines.mssql-log-shipping.image`
+  (`ghcr.io/openeverest/plugin-migrations-mssql-log-shipping`, released with
+  the plugin). Enabling it adds a ClusterRole that lets the backend `get`
+  Secrets (BackupStorage credentials).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
   all workers.
 - Plugin CR extension points: `route` and `sidebarItem` only. Permissions:
-  `read namespaces`, `read instances`, `read-connection instances`.
+  `read namespaces`, `read instances`, `read-connection instances`,
+  `read backup-storages`.
 
 ## 11. Open questions and risks
 
@@ -646,6 +744,26 @@ mode, also for its `replication` topology). The worker:
     keys are independent (`MSET`, `MSETNX`, `DEL`, `UNLINK`); others stop the
     migration with a message.
 
+16. **SQL Server: one log chain.** The migration's log backups take the
+    log records; any other log backup of the database (the operator's
+    point-in-time recovery schedule, a maintenance plan) leaves a gap the
+    target never gets. The migration detects and refuses it, but cannot
+    coexist with it. Reusing those backups (when they are in a storage the
+    target can read) would remove the restriction; the operator's PITR
+    restore chain code shows the LSN rules.
+17. **SQL Server: availability group targets.** The databases are restored on
+    the primary only. If the primary moves before the cutover, the worker
+    copies them again to the new primary (the operator adopts databases only
+    on the primary), which repeats the full load. After the cutover the
+    secondaries are seeded by the operator, so the group is not redundant
+    until seeding ends. Restoring `WITH NORECOVERY` on every replica
+    and joining them would avoid that, but needs the operator's cooperation.
+18. **SQL Server: backup storage access.** The plugin reads BackupStorage
+    credentials with a cluster-wide `get secrets` permission, because the
+    OpenEverest API returns none. An API endpoint for plugins (or a scoped
+    token) would remove it. SQL Server always verifies the storage's TLS
+    certificate, so a private CA must be mounted on both servers.
+
 ## 12. Roadmap
 
 - v0.2: preflight checks (connectivity, versions, privileges, oplog window),
@@ -661,6 +779,9 @@ mode, also for its `replication` topology). The worker:
   then attach the replication channel) for large databases, which needs
   provider support; Percona Server (Group Replication) targets; MariaDB
   replication-topology targets.
+- SQL Server: reuse the source's own log backups (PITR) instead of owning
+  the log chain; seed availability group secondaries from the shipped logs;
+  copy server roles, permissions and SQL Agent jobs.
 - Redis/Valkey: resumable runs (per-slot checkpoints, upstream in RedisShake
   or in the worker), and the RedisShake fixes for TLS verification and field
   expiration once released.

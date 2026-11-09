@@ -98,6 +98,17 @@ engines:
       repository: ghcr.io/openeverest/plugin-migrations-redis-shake
       tag: "0.1.0"
       pullPolicy: IfNotPresent
+  # SQL Server → SQL Server (provider-mssql targets) with log shipping
+  # through an OpenEverest BackupStorage: the servers back up to and restore
+  # from S3 themselves; see workers/mssql-log-shipping. Released together with
+  # the plugin. Enabling it grants the backend read access to Secrets in
+  # every namespace, to read the chosen BackupStorage's credentials.
+  mssql-log-shipping:
+    enabled: true
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-mssql-log-shipping
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

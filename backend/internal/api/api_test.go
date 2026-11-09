@@ -54,6 +54,10 @@ func (stubInstances) ListInstances(_ context.Context, _, k8sCluster string) ([]e
 	return []everest.InstanceSummary{{K8sCluster: k8sCluster, Namespace: "shop", Name: "orders", Provider: "percona-server-mongodb"}}, nil
 }
 
+func (stubInstances) ListBackupStorages(_ context.Context, _, _, namespace string) ([]everest.BackupStorageSummary, error) {
+	return []everest.BackupStorageSummary{{Name: namespace + "-s3", Type: "s3", Bucket: "b", Endpoint: "https://s3"}}, nil
+}
+
 func serve(service *stubService, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	mux := http.NewServeMux()
 	New(service, stubInstances{}).RegisterRoutes(mux)
@@ -183,5 +187,15 @@ func TestListInstancesRequiresCluster(t *testing.T) {
 	recorder := serve(&stubService{}, http.MethodGet, "/api/instances?k8sCluster=main", "", bearer)
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"provider":"percona-server-mongodb"`) {
 		t.Fatalf("instances = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestListBackupStorages(t *testing.T) {
+	if recorder := serve(&stubService{}, http.MethodGet, "/api/backup-storages?k8sCluster=main", "", bearer); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing namespace = %d", recorder.Code)
+	}
+	recorder := serve(&stubService{}, http.MethodGet, "/api/backup-storages?k8sCluster=main&namespace=shop", "", bearer)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"backupStorages":[{"name":"shop-s3"`) {
+		t.Fatalf("storages = %d %s", recorder.Code, recorder.Body.String())
 	}
 }

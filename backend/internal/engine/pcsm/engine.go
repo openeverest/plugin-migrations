@@ -48,6 +48,7 @@ func (e *Engine) Describe() engine.Descriptor {
 		SourceDatabaseTypes: []string{databaseTypeMongoDB},
 		TargetDatabaseTypes: []string{databaseTypeMongoDB},
 		TargetProviders:     slices.Clone(targetProviders),
+		CanPause:            true,
 	}
 }
 

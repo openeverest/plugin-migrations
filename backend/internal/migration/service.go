@@ -202,7 +202,8 @@ func (s *Service) resolveInstance(ctx context.Context, token string, request End
 		Type: EndpointInstance, K8sCluster: ref.K8sCluster, Namespace: ref.Namespace, Name: ref.Name,
 		Provider: details.Provider, DatabaseType: details.Type,
 	}
-	connection := engine.Connection{URI: details.URI, Username: details.Username, Password: details.Password, CACert: details.CACert}
+	connection := engine.Connection{URI: details.URI, Username: details.Username, Password: details.Password, CACert: details.CACert,
+		Properties: details.Properties}
 	return endpoint, connection, nil
 }
 
@@ -429,7 +430,7 @@ func (s *Service) observe(ctx context.Context, record Record) observation {
 	if err != nil {
 		return observation{status: engine.Status{Phase: notReadyPhase, Error: err.Error()}, at: now}
 	}
-	return observation{status: status, at: now, workerReady: true}
+	return observation{status: status, at: now, workerReady: true, canPause: registration.Engine.Describe().CanPause}
 }
 
 func (s *Service) storeObservation(id string, observed observation) {

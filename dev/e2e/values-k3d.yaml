@@ -17,3 +17,18 @@ engines:
       repository: plugin-migrations-postgres-logical
       tag: e2e
       pullPolicy: Never
+  mysql-replication:
+    image:
+      repository: plugin-migrations-mysql-replication
+      tag: e2e
+      pullPolicy: Never
+  mariadb-replication:
+    image:
+      repository: plugin-migrations-mysql-replication
+      tag: e2e
+      pullPolicy: Never
+  redis-shake:
+    image:
+      repository: plugin-migrations-redis-shake
+      tag: e2e
+      pullPolicy: Never

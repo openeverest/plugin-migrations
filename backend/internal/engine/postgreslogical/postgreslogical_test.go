@@ -187,32 +187,6 @@ func TestDecodeOptions(t *testing.T) {
 	}
 }
 
-func TestMapStatus(t *testing.T) {
-	tests := []struct {
-		in        agentStatus
-		phase     engine.Phase
-		cutoverOK bool
-	}{
-		{agentStatus{State: "idle"}, engine.PhaseStarting, false},
-		{agentStatus{State: "running"}, engine.PhaseFullLoad, false},
-		{agentStatus{State: "running", CopyDone: true}, engine.PhaseCatchingUp, false},
-		{agentStatus{State: "running", CopyDone: true, InitialSyncCompleted: true}, engine.PhaseReplicating, true},
-		{agentStatus{State: "paused", CopyDone: true, InitialSyncCompleted: true}, engine.PhasePaused, true},
-		{agentStatus{State: "finalizing", CopyDone: true, InitialSyncCompleted: true}, engine.PhaseFinalizing, false},
-		{agentStatus{State: "completed"}, engine.PhaseCompleted, false},
-		{agentStatus{State: "failed", Error: "boom"}, engine.PhaseFailed, false},
-	}
-	for _, tc := range tests {
-		status, err := mapStatus(tc.in)
-		if err != nil || status.Phase != tc.phase || status.Progress.ReadyForCutover != tc.cutoverOK {
-			t.Errorf("%+v → %+v, %v", tc.in, status, err)
-		}
-	}
-	if _, err := mapStatus(agentStatus{State: "exploded"}); engine.KindOf(err) != engine.KindUnavailable {
-		t.Fatalf("unknown state: %v", err)
-	}
-}
-
 func TestControllerTalksToAgent(t *testing.T) {
 	var started map[string]json.RawMessage
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

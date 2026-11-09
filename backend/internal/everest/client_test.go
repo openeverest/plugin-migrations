@@ -43,8 +43,29 @@ func TestGetConnectionDecodesCA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if details.Type != "mongodb" || details.CACert != "PEM" || details.URI == "" {
+	if details.Type != "mongodb" || details.CACert != "PEM" || details.URI == "" || details.Properties != nil {
 		t.Fatalf("details = %+v", details)
+	}
+}
+
+func TestGetConnectionKeepsProviderProperties(t *testing.T) {
+	client := fakeEverest(t, map[string]func(http.ResponseWriter){
+		"/v1/clusters/main/namespaces/shop/instances/orders/connection": respond(200,
+			`{"type":"mysql","provider":"mariadb","uri":"mysql://h:3306/everest","username":"everest","password":"pw",`+
+				`"admin-username":"root","admin-password":"rootpw","admin-tls":"true","nested":{"a":1},"count":3}`),
+	})
+	details, err := client.GetConnection(context.Background(), "jwt", InstanceRef{"main", "shop", "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"admin-username": "root", "admin-password": "rootpw", "admin-tls": "true"}
+	if details.Username != "everest" || len(details.Properties) != len(want) {
+		t.Fatalf("details = %+v", details)
+	}
+	for key, value := range want {
+		if details.Properties[key] != value {
+			t.Errorf("%s = %q", key, details.Properties[key])
+		}
 	}
 }
 

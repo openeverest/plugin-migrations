@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -178,7 +179,7 @@ type fakeEngine struct {
 
 func (e *fakeEngine) ID() string { return "fake" }
 func (e *fakeEngine) Describe() engine.Descriptor {
-	return engine.Descriptor{ID: "fake", SourceDatabaseTypes: []string{"mongodb"}, TargetDatabaseTypes: []string{"mongodb"}, TargetProviders: []string{"psmdb"}}
+	return engine.Descriptor{ID: "fake", SourceDatabaseTypes: []string{"mongodb"}, TargetDatabaseTypes: []string{"mongodb"}, TargetProviders: []string{"psmdb"}, CanPause: true}
 }
 func (e *fakeEngine) Supports(source, target engine.EndpointInfo) bool {
 	return source.DatabaseType == "mongodb" && target.DatabaseType == "mongodb"
@@ -564,11 +565,15 @@ func TestAllowedActions(t *testing.T) {
 	}
 	for _, test := range tests {
 		got := make([]string, 0)
-		for _, action := range allowedActions(observation{status: test.status, workerReady: true}) {
+		for _, action := range allowedActions(observation{status: test.status, workerReady: true, canPause: true}) {
 			got = append(got, string(action))
 		}
 		if strings.Join(got, ",") != test.want {
 			t.Errorf("%s: got %v, want %s", test.status.Phase, got, test.want)
 		}
+	}
+	replicating := observation{status: engine.Status{Phase: engine.PhaseReplicating}, workerReady: true}
+	if slices.Contains(allowedActions(replicating), ActionPause) {
+		t.Error("an engine that cannot pause must not offer pause")
 	}
 }

@@ -150,6 +150,9 @@ func TestWorkloadsApply(t *testing.T) {
 	if items := pod.Volumes[0].Secret.Items; len(items) != 1 || items[0].Key != "target-ca.crt" {
 		t.Fatalf("only secret files may be projected: %+v", items)
 	}
+	if mode := pod.Volumes[0].Secret.DefaultMode; mode == nil || *mode&0o004 == 0 {
+		t.Fatalf("workers run as their image's non-root user and must be able to read secret files: mode %v", mode)
+	}
 	if container.ReadinessProbe.HTTPGet.Path != "/metrics" {
 		t.Fatal("probe must use the engine health path")
 	}

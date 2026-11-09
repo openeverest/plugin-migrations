@@ -1,6 +1,6 @@
 # plugin-migrations — Architecture
 
-> Status: **Draft v0.1** · Last updated: 2026-11-04
+> Status: **Draft v0.1** · Last updated: 2026-11-09
 
 `plugin-migrations` is an OpenEverest generic plugin that moves data **into**
 OpenEverest-managed databases with minimal downtime. It works like
@@ -14,8 +14,11 @@ plugs into a shared lifecycle, storage, API and UI, the same way
 plugin-bench adds benchmark drivers. The engines are **MongoDB → MongoDB**
 built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-(PCSM), and **PostgreSQL → PostgreSQL** built on native logical replication
-(`postgres-logical`).
+(PCSM), **PostgreSQL → PostgreSQL** built on native logical replication
+(`postgres-logical`), **MySQL → MySQL** and **MariaDB → MariaDB** built on
+native GTID replication (`mysql-replication`, `mariadb-replication`), and
+**Redis / Valkey → Valkey** built on
+[RedisShake](https://github.com/tair-opensource/RedisShake) (`redis-shake`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -71,7 +74,10 @@ Backend layers (Go, `backend/internal/...`):
 | --- | --- | --- |
 | `engine` | Technology-agnostic contracts: `Engine`, `Controller`, `WorkerSpec`, `Status`, `Phase`; engine registry. | Nothing else |
 | `engine/pcsm` | MongoDB engine: option validation, worker spec (image, env, secrets), PCSM HTTP client, and mapping PCSM state to `engine.Status`. | `engine` |
-| `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), client for the agent in `workers/postgres-logical`, teardown. | `engine` |
+| `engine/agentclient` | HTTP client for the agents in `workers/` (one API: status, start, pause, resume, cutover, teardown) and the mapping of agent states to `engine.Status`. | `engine` |
+| `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), teardown. | `engine`, `engine/agentclient` |
+| `engine/mysqlreplication` | MySQL and MariaDB engines (one worker image, `FLAVOR` env): option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files; provider-mariadb admin connections), teardown. | `engine`, `engine/agentclient` |
+| `engine/redisshake` | Redis/Valkey engine: option validation, worker spec (redis[s]:// URIs, CA and provider-valkey client certificate files), teardown. Declares `CanPause: false`. | `engine`, `engine/agentclient` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
 | `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
@@ -88,7 +94,7 @@ know about specific engines.
 // engine.Engine: pure, no I/O. Shared across requests.
 type Engine interface {
     ID() string                                     // "pcsm"
-    Describe() Descriptor                           // display name, source/target DB types, target providers
+    Describe() Descriptor                           // display name, source/target DB types, target providers, CanPause
     Supports(source, target EndpointInfo) bool      // database type compatibility
     Prepare(PrepareInput) (Prepared, error)         // validate options → WorkerSpec + safe options snapshot
     Controller(baseURL string) Controller           // client for a running worker
@@ -179,13 +185,28 @@ PCSM mapping:
 Lag is the source's `now()` minus the last heartbeat replicated to the target,
 so it uses only the source clock.
 
+`mysql-replication` and `mariadb-replication` use the same agent states and
+phases. `full-load` covers the preflight and the copy (MySQL Shell or
+mydumper/myloader); once the channel runs, the phase is
+`catching-up` until the replicated heartbeat lag is 15s or less (then
+`replicating`). A channel stopped by an applier error stays `replicating` (or
+`catching-up`) with the error shown; the agent restarts it every minute, so it
+continues once the cause is fixed.
+
+`redis-shake` uses the same agent states. `full-load` covers the preflight and
+the snapshot RedisShake loads (progress is the snapshot bytes applied, summed
+over the source shards); then `catching-up` until the heartbeat lag is 15s or
+less. RedisShake cannot resume a run: when it stops on a lost connection or a
+restart, the worker empties the target and copies again from the beginning,
+and the phase goes back to `full-load` with the reason in the message.
+
 ### Allowed actions
 
 The backend computes `allowedActions` so the UI does not duplicate engine rules.
 
 | Action | Allowed when |
 | --- | --- |
-| `pause` | `catching-up`, `replicating` (PCSM can only pause change replication) |
+| `pause` | `catching-up`, `replicating`, for engines whose descriptor sets `canPause` (PCSM can only pause change replication; `redis-shake` cannot pause) |
 | `resume` | `paused`, `failed` |
 | `cutover` | `replicating`, or `paused` with the initial sync complete |
 | `delete` | always (the UI asks for confirmation unless the migration is `completed`/`failed`) |
@@ -250,7 +271,8 @@ it later (for GitOps) without changing the domain service.
    action is allowed for the live phase, then call the controller.
 4. **Delete**: if the engine's controller is a `Teardowner` and the migration
    was started, call `Teardown` first (PostgreSQL: drop the subscription, the
-   source slot and publication, and the heartbeat tables). A failed teardown
+   source slot and publication, and the heartbeat tables; MySQL: remove the
+   replication channel and the `openeverest_migration` databases). A failed teardown
    returns 502 and keeps the record, so nothing is left retaining WAL
    silently; `?force=true` skips it when the source no longer exists. Then
    delete the ConfigMap. The worker stops and data already written to the
@@ -292,7 +314,8 @@ upstream or worker failure).
       "displayName": "Percona ClusterSync for MongoDB",
       "sourceDatabaseTypes": ["mongodb"],
       "targetDatabaseTypes": ["mongodb"],
-      "targetProviders": ["percona-server-mongodb"]
+      "targetProviders": ["percona-server-mongodb"],
+      "canPause": true
     }
   ]
 }
@@ -401,6 +424,106 @@ Only `provider-percona-postgresql` targets are offered, because `CREATE
 SUBSCRIPTION` needs the superuser that its connection details provide. The
 source and target must be different servers.
 
+### MySQL engine options (`engine: "mysql-replication"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `databases` | `string[]` | database in the source URI | Required for instance sources. Databases keep their names on the target. System databases and `openeverest_migration` cannot be migrated. |
+| `excludeTables` | `string[]` (`database.table`) | `[]` | Neither copied nor replicated (`REPLICATE_IGNORE_TABLE`). Must belong to a migrated database. |
+| `recreateDatabases` | `bool` | `false` | Drop the databases on the target first. Otherwise an existing database fails the preflight. |
+| `copyThreads` | `int` (1–32) | `4` | MySQL Shell threads reading the source, and as many writing to the target. |
+
+Views, routines, triggers and events whose definer holds `SYSTEM_USER` on
+the target (for example `root@localhost`) are recreated with the target user
+as definer, because that user lacks `SYSTEM_USER`. Each migration has its own
+heartbeat table, so several migrations can share a source.
+
+Only `percona-xtradb-cluster` targets are offered: their connection details
+are `root`, which can configure replication, `gtid_purged` and `local_infile`,
+and PXC runs with `skip_replica_start`, which keeps a restarted node from
+replicating before the worker restores the channel filters (MySQL does not
+persist them). The worker pins the channel to the PXC node behind the proxy
+(`wsrep_node_incoming_address`), because the copy's `gtid_purged` exists only
+on that node. See [workers/mysql-replication](../workers/mysql-replication/README.md).
+
+Source URIs may set `ssl-mode` (MySQL client names) or `tls` (Go driver
+names, as OpenEverest providers publish: `tls=false` is `DISABLED`). A CA
+certificate makes the worker verify the server (`VERIFY_CA`); verifying modes
+without a CA are rejected. The target server's replication connection uses TLS
+unless the source is `DISABLED`, but cannot verify it.
+
+### MariaDB engine options (`engine: "mariadb-replication"`)
+
+The options are those of `mysql-replication`; `copyThreads` sets mydumper's
+and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
+
+- mydumper streams a consistent snapshot (`BACKUP STAGE BLOCK_COMMIT`) into
+  myloader through the worker, which reads the snapshot's GTID position from
+  the stream's `metadata` file. Nothing is written to the worker's disk except
+  the tools' option files (credentials never appear in a command line).
+- The target sets `gtid_slave_pos` and replicates over a named connection
+  (`CHANGE MASTER 'mig_…'`, `MASTER_USE_GTID=slave_pos`) with the same table
+  filters, set through the connection's `replicate_*` variables. MariaDB
+  has no `SYSTEM_USER`, so definers are kept.
+- OpenEverest instances are reached with the admin (root) connection that
+  provider-mariadb 0.2.2+ publishes as `admin-*` keys, which the backend
+  reads from the instance's connection details (`engine.Connection.Properties`).
+  The application user cannot replicate. Only targets whose provider
+  publishes `admin-skip-replica-start=true` (standalone and Galera: started
+  with `skip-slave-start`) are accepted. MariaDB does not expose that setting
+  as a variable, so the worker cannot check it itself. A replication-topology
+  target is refused: the operator does not start a replica's server again
+  after its own replication changes, and a switchover resets
+  `gtid_slave_pos`.
+- On Galera, `gtid_slave_pos` is per node, so the channel is pinned to the
+  node behind the Service: the entry of `wsrep_cluster_address` named after
+  `wsrep_node_name` (mariadb-operator leaves `wsrep_node_incoming_address`
+  at `AUTO`).
+- Versions: source 10.6+, target 10.11+ and the same or a newer series.
+  Preflight also requires `binlog_format=ROW` and different `server_id`s on
+  the source and the target (both engines check this: a replica ignores
+  changes carrying its own `server_id`).
+
+### Redis / Valkey engine options (`engine: "redis-shake"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `flushTarget` | `bool` | `false` | Delete every key on the target before the copy. Otherwise a target with keys fails the preflight. |
+| `excludeKeyPrefixes` | `string[]` (≤ 64) | `[]` | Keys starting with these are neither copied nor replicated. Applied in RedisShake's Lua hook, not `block_key_prefix`, which silently drops a whole command when only some of its keys match; a command that changes both excluded and migrated keys (other than `MSET`/`MSETNX`/`DEL`/`UNLINK`, which are split) stops the migration. `__openeverest_migration:` is reserved. |
+
+Sources are external `redis[s]://` / `valkey[s]://` URIs (a standalone
+primary or any primary of a cluster) or `valkey` instances. Targets are
+`valkey` instances, always clusters (provider-valkey runs Valkey in cluster
+mode, also for its `replication` topology). The worker:
+
+- **Preflight**: the source is a primary; both clusters report `cluster_state:ok`;
+  the source has keys only in database 0; no hashes with field expiration
+  between different server types (Redis `subexpiry`, Valkey
+  `keys_with_volatile_items`); the target is empty unless `flushTarget`; the
+  source and target `run_id`s differ.
+- **Copy and replication**: RedisShake 4.7 (`sync_reader` → `redis_writer`,
+  cluster mode as detected) with `rdb_restore_command_behavior = "rewrite"`.
+  A Lua hook stops the migration on writes to another database and drops
+  `PUBLISH`.
+- **Heartbeat**: one key for every pair of a source shard and a target shard
+  that share slots (`__openeverest_migration:{tag}:<name>:heartbeat`, the tag
+  picking a shared slot), set to the source clock every 5s. RedisShake sends
+  one source shard's changes for one target shard over one ordered
+  connection, so a heartbeat on the target proves everything sent before it
+  in that pair was applied. Lag is the age of the oldest heartbeat not yet on
+  the target.
+- **State**: `__openeverest_migration:<name>:state` on the target (`copying`,
+  `failed` with the reason, `stopped`, `completed`). A restarted worker copies
+  again only from `copying`; `failed` waits for a resume, and `stopped` (the
+  cutover had stopped RedisShake) only finishes the cleanup. Only once the
+  state exists does the worker empty the target on its own; a migration that
+  failed its preflight runs it again on resume.
+- **Cutover**: writes a final heartbeat, newer than every earlier one, into
+  every shard pair and waits until the target has all of them (at most 15
+  minutes), so every change made before the request is applied even while
+  the source keeps taking writes. It then stops RedisShake and removes the
+  heartbeat keys on both sides.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -429,6 +552,14 @@ source and target must be different servers.
 - `engines.postgres-logical.enabled` and `engines.postgres-logical.image`
   (`ghcr.io/openeverest/plugin-migrations-postgres-logical`, released with
   the plugin).
+- `engines.mysql-replication.enabled` and `engines.mysql-replication.image`
+  (`ghcr.io/openeverest/plugin-migrations-mysql-replication`, released with
+  the plugin).
+- `engines.mariadb-replication.enabled` and `engines.mariadb-replication.image`
+  (the same image as `mysql-replication`).
+- `engines.redis-shake.enabled` and `engines.redis-shake.image`
+  (`ghcr.io/openeverest/plugin-migrations-redis-shake`, with RedisShake 4.7.0,
+  released with the plugin).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
@@ -465,6 +596,55 @@ source and target must be different servers.
 8. **PostgreSQL schema changes.** DDL is not replicated; the user must freeze
    it until cutover. Operator-managed schemas (`pgbouncer`) differ between
    providers and are excluded by a fixed list.
+9. **MySQL binary log retention.** Unlike a PostgreSQL slot, a replication
+   channel does not make the source keep its binary logs. If the copy or a
+   pause outlasts the source's retention, the channel fails with error 1236
+   and the migration must be created again. A preflight warning based on
+   `binlog_expire_logs_seconds` (RDS: binlog retention hours) would help.
+10. **MySQL channel placement on PXC.** The channel and the copy's
+    `gtid_purged` live on one node. A restarted node keeps them and the worker
+    restarts the channel; a node rebuilt by SST loses them, and the migration
+    fails. Appending `gtid_purged` on every node, or the operator's
+    `replicationChannels` (which also moves the channel when the primary
+    changes), would let the channel follow the primary; the latter needs
+    provider support.
+11. **MySQL filters and non-table DDL.** Table filters do not match statements
+    that touch no table (`CREATE PROCEDURE other.p`). The worker skips such a
+    transaction when it fails with *Unknown database* for a database that is
+    not migrated; any other failure stops the channel and is reported.
+    Database filters (`REPLICATE_DO_DB`) are not used: they match DDL by the
+    session's default database and would skip qualified DDL silently.
+12. **MySQL targets other than PXC.** provider-percona-server-mysql publishes
+    no connection URI, which the backend requires, and Group Replication
+    primaries change. Supporting it needs a URI from the provider and a plan
+    for primary changes.
+13. **MariaDB targets.** The same binary log retention and channel placement
+    limits apply (a Galera node rebuilt by SST loses `gtid_slave_pos`). On
+    Galera, account statements (`CREATE/ALTER/DROP USER`, roles, `GRANT`,
+    `REVOKE`) from the source reach the other nodes: `mysql_execute_command`
+    begins total order isolation before the ACL code checks the replication
+    filters, so the replica node skips them while the rest of the cluster
+    executes them (verified on MariaDB 12.3; PXC filters them first). The
+    worker cannot prevent this; the UI warns users not to change accounts on
+    the source during a Galera migration. A fix belongs upstream.
+    Replication-topology targets need the operator to keep a migration
+    connection across restarts and switchovers. Grants through roles are not
+    seen by the source privilege check (`SHOW GRANTS` of the user only).
+14. **Redis/Valkey: no resume.** RedisShake 4 restarts from a full snapshot
+    after any interruption, and each attempt makes every source shard fork for
+    a snapshot; the worker gives up after 5 failed copies in a row. Resuming
+    is possible in principle (`PSYNC <replid> <offset>` continues, also across
+    a source failover), but applying replayed commands exactly once needs a
+    per-slot checkpoint written in the same transaction as the data, which
+    RedisShake does not do (cluster targets reject cross-slot transactions).
+15. **Redis/Valkey: stock RedisShake 4.7 limits.** It does not verify server
+    certificates (the worker's own checks do), and it cannot copy hashes with
+    field expiration between Redis 8 and Valkey 9, so the preflight refuses
+    such sources. Both are fixed upstream in tair-opensource/RedisShake#1075
+    and #1074 (pending). Module types (RedisJSON, Bloom, …) cannot be copied
+    to Valkey. Commands whose keys hash to different slots are split when the
+    keys are independent (`MSET`, `MSETNX`, `DEL`, `UNLINK`); others stop the
+    migration with a message.
 
 ## 12. Roadmap
 
@@ -477,6 +657,12 @@ source and target must be different servers.
   replication, promote at cutover) for whole-cluster migrations with DDL. It
   needs provider support to create an instance as a standby and promote it.
   `pgcopydb` was evaluated and set aside until its CDC fixes are released.
-- Next engines: MySQL (Percona XtraBackup + replication, or a binlog-based CDC
-  tool).
+- MySQL: a physical engine (restore an XtraBackup backup into the target,
+  then attach the replication channel) for large databases, which needs
+  provider support; Percona Server (Group Replication) targets; MariaDB
+  replication-topology targets.
+- Redis/Valkey: resumable runs (per-slot checkpoints, upstream in RedisShake
+  or in the worker), and the RedisShake fixes for TLS verification and field
+  expiration once released.
+- Cross-engine migrations (for example with Debezium Server and its JDBC sink).
 - Optional Migration CRD and controller for GitOps.

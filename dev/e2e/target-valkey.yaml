@@ -1,0 +1,28 @@
+# OpenEverest Valkey target (provider-valkey, replication topology: one
+# shard, a primary and a replica, in cluster mode). Connection details point
+# at the valkey-<name>-primary Service.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: orders-valkey
+  namespace: shop
+spec:
+  providerRef:
+    name: valkey
+  version: "9.0"
+  topology:
+    type: replication
+  components:
+    engine:
+      type: valkey
+      replicas: 1
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "1", memory: 512Mi}
+      storage:
+        size: 1Gi

@@ -58,6 +58,33 @@ type ConnectionDetails struct {
 	URI      string `json:"uri"`
 	// CACert is published by providers whose instances use a private CA.
 	CACert string `json:"ca.crt"`
+	// Properties holds the provider's other string keys (OpenEverest returns
+	// them next to the well-known ones), e.g. an admin connection.
+	Properties map[string]string `json:"-"`
+}
+
+var connectionDetailsKeys = []string{"type", "provider", "host", "port", "username", "password", "uri", "ca.crt"}
+
+func (d *ConnectionDetails) UnmarshalJSON(data []byte) error {
+	type wellKnown ConnectionDetails
+	if err := json.Unmarshal(data, (*wellKnown)(d)); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for key, raw := range all {
+		var value string
+		if slices.Contains(connectionDetailsKeys, key) || json.Unmarshal(raw, &value) != nil {
+			continue
+		}
+		if d.Properties == nil {
+			d.Properties = map[string]string{}
+		}
+		d.Properties[key] = value
+	}
+	return nil
 }
 
 type Client struct {

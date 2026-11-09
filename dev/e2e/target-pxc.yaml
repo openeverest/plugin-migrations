@@ -1,0 +1,28 @@
+# OpenEverest MySQL target (provider-percona-xtradb-cluster): one PXC node
+# behind HAProxy, which is what the connection details point at.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: orders-mysql
+  namespace: shop
+spec:
+  providerRef:
+    name: percona-xtradb-cluster
+  topology:
+    type: cluster
+  components:
+    engine:
+      replicas: 1
+      resources:
+        requests: {cpu: 200m, memory: 768Mi}
+        limits: {cpu: "1", memory: 1536Mi}
+      storage:
+        size: 2Gi
+    proxy:
+      type: haproxy
+      replicas: 1

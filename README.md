@@ -10,8 +10,10 @@ keeps the target in sync with ongoing changes (**CDC**), and you trigger
 > (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication,
 > **MySQL → MySQL** and **MariaDB → MariaDB** built on native GTID replication,
 > **Redis / Valkey → Valkey** built on
-> [RedisShake](https://github.com/tair-opensource/RedisShake), and
-> **SQL Server → SQL Server** built on log shipping through S3.
+> [RedisShake](https://github.com/tair-opensource/RedisShake),
+> **SQL Server → SQL Server** built on log shipping through S3, and
+> **MySQL → TiDB** built on
+> [TiDB Data Migration](https://docs.pingcap.com/tidb/stable/dm-overview/) (DM).
 > The plugin appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
@@ -26,7 +28,8 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
                                            ConfigMap  mig-xxxx   ← migration record (no credentials)
                                              ├─ Secret      mig-xxxx   ← endpoint URIs / CAs
                                              ├─ Deployment  mig-xxxx   ← engine worker (e.g. PCSM)
-                                             └─ Service     mig-xxxx   ← worker control API
+                                             ├─ Service     mig-xxxx   ← worker control API
+                                             └─ PVC         mig-xxxx   ← worker volume (tidb-dm only)
 ```
 
 1. **Create**: choose an engine, a source (an OpenEverest instance or an
@@ -43,7 +46,8 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
    waiting for the source's GTID position, removing the replication channel,
    and enabling events; Redis/Valkey: waiting until the target has every
    change and stopping RedisShake; SQL Server: restoring a final log backup
-   and recovering the databases).
+   and recovering the databases; TiDB: waiting until DM saved the source's
+   position, creating the views and removing DM's task).
 4. **Delete**: removes the worker. Data on the target is kept. Engines that
    leave replication state behind (PostgreSQL) clean it up first.
 
@@ -52,7 +56,8 @@ survive backend restarts and upgrades. Worker progress is checkpointed by the
 engine itself (PCSM stores checkpoints in the target cluster; PostgreSQL keeps
 the replication state in the target's subscription and the source's slot;
 MySQL and MariaDB keep it in the target's replication channel and GTID
-position).
+position; DM keeps its checkpoints in TiDB and its own state on the worker's
+volume).
 
 ## Engines
 
@@ -64,6 +69,7 @@ position).
 | `mariadb-replication` | MariaDB 10.6+ (OpenEverest `mariadb` instance or external URI) | OpenEverest `mariadb` standalone or Galera instance (10.11+, provider-mariadb 0.2.2+) | same image as `mysql-replication` |
 | `redis-shake` | Redis 2.8+ / Valkey, standalone or cluster (OpenEverest `valkey` instance or external URI) | OpenEverest `valkey` instance | `ghcr.io/openeverest/plugin-migrations-redis-shake` |
 | `mssql-log-shipping` | SQL Server 2022+ (OpenEverest `mssql` instance or external URI) | OpenEverest `mssql` instance (2022+, standalone or availability group) | `ghcr.io/openeverest/plugin-migrations-mssql-log-shipping` |
+| `tidb-dm` | MySQL 5.7–8.4 / Percona Server / PXC (OpenEverest `percona-xtradb-cluster` instance or external URI) | OpenEverest `tidb` instance | `ghcr.io/openeverest/plugin-migrations-tidb-dm` |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
@@ -108,6 +114,13 @@ the target databases*, *copy logins*, *leave the source databases
 restoring*, and the log backup interval. See
 [workers/mssql-log-shipping/README.md](workers/mssql-log-shipping/README.md).
 
+`tidb-dm` migrates one or more MySQL databases into TiDB with TiDB Data
+Migration. The worker runs a dm-master and a dm-worker: DM dumps the databases
+to the worker's volume, loads them into TiDB and replicates the binary log,
+schema changes included. Options: the databases, table excludes, *recreate the
+target databases*, the size of the dump volume, and copy and replication
+threads. See [workers/tidb-dm/README.md](workers/tidb-dm/README.md).
+
 ### Adding an engine
 
 1. Backend: implement `engine.Engine` in `backend/internal/engine/<id>/`
@@ -149,11 +162,14 @@ Then open **Migrations** in the OpenEverest sidebar.
 | `engines.redis-shake.image.*` | Redis / Valkey worker image | `ghcr.io/openeverest/plugin-migrations-redis-shake` (chart version) |
 | `engines.mssql-log-shipping.enabled` | Enable the SQL Server log shipping engine; also grants the backend `get` on Secrets cluster-wide, to read the chosen BackupStorage's credentials | `true` |
 | `engines.mssql-log-shipping.image.*` | SQL Server worker image | `ghcr.io/openeverest/plugin-migrations-mssql-log-shipping` (chart version) |
+| `engines.tidb-dm.enabled` | Enable the MySQL → TiDB (DM) engine | `true` |
+| `engines.tidb-dm.image.*` | TiDB DM worker image | `ghcr.io/openeverest/plugin-migrations-tidb-dm` (chart version) |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
 | `worker.nodeSelector`, `worker.tolerations` | Worker placement | `{}`, `[]` |
 | `worker.imagePullSecrets` | Pull secrets for worker images | `[]` |
+| `worker.storageClassName` | Storage class of worker volumes (tidb-dm) | cluster default |
 | `reconcileInterval` | Status refresh / auto-start interval | `5s` |
 | `everestAPIURL` | OpenEverest API URL | auto-discovered |
 
@@ -307,6 +323,41 @@ SQL Server (`mssql-log-shipping`):
   database back with `RESTORE DATABASE … WITH RECOVERY` and `ALTER DATABASE
   … SET MULTI_USER`.
 
+TiDB (`tidb-dm`):
+
+- Source: MySQL 5.7 to 8.4 (Percona Server, PXC, RDS/Aurora MySQL; not
+  MariaDB; 8.4 is experimental in DM) with binary logging,
+  `binlog_format=ROW`, `binlog_row_image=FULL`,
+  `binlog_transaction_compression=OFF` and a `server_id`. GTIDs are used when
+  `gtid_mode=ON` and are not required. The user needs `SELECT`, `RELOAD`,
+  `REPLICATION SLAVE`, `REPLICATION CLIENT` and `PROCESS` (DM's precheck lists
+  what is missing) and must be able to create the migration's heartbeat
+  database (`openeverest_mig_…`).
+- Target: an OpenEverest `tidb` instance. Its connection details must include
+  a `uri`, which provider-tidb publishes from 0.2.4. Only
+  the worker connects to the source.
+- **The dump is staged on the worker's volume** before it is loaded:
+  *Dump storage* must hold about as much as the source data, and preflight
+  refuses a source that does not fit. A restarted worker keeps the volume and
+  continues the copy.
+- Schema changes replicate. TiDB has no stored routines, triggers or events:
+  they are not migrated (the status lists them) and FULLTEXT indexes are
+  dropped. Views are created on TiDB by the worker (defined by the target
+  user) once replication runs and again at the cutover. User accounts are not
+  copied.
+- Tables with collations or character sets TiDB lacks (for example
+  `latin1_swedish_ci`), spatial columns, or foreign keys with `CASCADE` /
+  `SET NULL` actions are refused by preflight: convert or exclude them.
+- A statement TiDB cannot parse stops the migration if it changes a migrated
+  database; one that creates or alters a table or database outside the
+  migration is skipped.
+- DM verifies TLS against a CA (host names included) or does not use TLS:
+  `ssl-mode=REQUIRED` without a CA is refused.
+- The databases must not have tables on the target, or enable *Recreate the
+  target databases*.
+- The source keeps binary logs on its own schedule. If the copy or a pause
+  outlasts its retention, the migration fails and must be created again.
+
 ## Development
 
 ```bash
@@ -317,6 +368,7 @@ make backend      # gofmt + go vet + go test + go build
 (cd workers/mysql-replication && go test ./...)  # MySQL and MariaDB worker agent
 (cd workers/redis-shake && go test ./...)        # Redis / Valkey worker agent
 (cd workers/mssql-log-shipping && go test ./...) # SQL Server worker agent
+(cd workers/tidb-dm && go test ./...)            # MySQL → TiDB worker agent
 make helm-lint
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```

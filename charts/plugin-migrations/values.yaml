@@ -109,6 +109,17 @@ engines:
       repository: ghcr.io/openeverest/plugin-migrations-mssql-log-shipping
       tag: "0.1.0"
       pullPolicy: IfNotPresent
+  # MySQL → TiDB (provider-tidb targets) with TiDB Data Migration (DM): the
+  # worker runs dm-master and dm-worker, which dump the databases to the
+  # worker's volume (worker.storageClassName), load them into TiDB and then
+  # replicate the binary log. See workers/tidb-dm. Released together with the
+  # plugin.
+  tidb-dm:
+    enabled: true
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-tidb-dm
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

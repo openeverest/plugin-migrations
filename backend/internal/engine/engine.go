@@ -48,6 +48,9 @@ type Descriptor struct {
 	SourceDatabaseTypes []string `json:"sourceDatabaseTypes"`
 	TargetDatabaseTypes []string `json:"targetDatabaseTypes"`
 	TargetProviders     []string `json:"targetProviders"`
+	// CanPause tells whether a running migration can be paused and resumed
+	// where it stopped.
+	CanPause bool `json:"canPause"`
 }
 
 // EndpointInfo is what an engine needs to decide compatibility.

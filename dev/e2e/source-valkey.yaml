@@ -1,0 +1,30 @@
+# OpenEverest Valkey source (provider-valkey, a 3-shard cluster with TLS, the
+# provider's defaults). The migration reads it with the default user, whose
+# connection details include the CA and a client certificate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legacy
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: legacy-valkey
+  namespace: legacy
+spec:
+  providerRef:
+    name: valkey
+  version: "9.0"
+  topology:
+    type: cluster
+    parameters:
+      numShards: 3
+  components:
+    engine:
+      type: valkey
+      replicas: 0
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "1", memory: 512Mi}
+      storage:
+        size: 1Gi

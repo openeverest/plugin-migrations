@@ -15,8 +15,10 @@ plugin-bench adds benchmark drivers. The engines are **MongoDB → MongoDB**
 built on
 [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
 (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication
-(`postgres-logical`), and **MySQL → MySQL** and **MariaDB → MariaDB** built
-on native GTID replication (`mysql-replication`, `mariadb-replication`).
+(`postgres-logical`), **MySQL → MySQL** and **MariaDB → MariaDB** built on
+native GTID replication (`mysql-replication`, `mariadb-replication`), and
+**Redis / Valkey → Valkey** built on
+[RedisShake](https://github.com/tair-opensource/RedisShake) (`redis-shake`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -75,6 +77,7 @@ Backend layers (Go, `backend/internal/...`):
 | `engine/agentclient` | HTTP client for the agents in `workers/` (one API: status, start, pause, resume, cutover, teardown) and the mapping of agent states to `engine.Status`. | `engine` |
 | `engine/postgreslogical` | PostgreSQL engine: option validation, worker spec (source/target URIs, the conninfo the target uses to subscribe), teardown. | `engine`, `engine/agentclient` |
 | `engine/mysqlreplication` | MySQL and MariaDB engines (one worker image, `FLAVOR` env): option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files; provider-mariadb admin connections), teardown. | `engine`, `engine/agentclient` |
+| `engine/redisshake` | Redis/Valkey engine: option validation, worker spec (redis[s]:// URIs, CA and provider-valkey client certificate files), teardown. Declares `CanPause: false`. | `engine`, `engine/agentclient` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest` interfaces |
 | `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details). | HTTP |
@@ -91,7 +94,7 @@ know about specific engines.
 // engine.Engine: pure, no I/O. Shared across requests.
 type Engine interface {
     ID() string                                     // "pcsm"
-    Describe() Descriptor                           // display name, source/target DB types, target providers
+    Describe() Descriptor                           // display name, source/target DB types, target providers, CanPause
     Supports(source, target EndpointInfo) bool      // database type compatibility
     Prepare(PrepareInput) (Prepared, error)         // validate options → WorkerSpec + safe options snapshot
     Controller(baseURL string) Controller           // client for a running worker
@@ -190,13 +193,20 @@ mydumper/myloader); once the channel runs, the phase is
 `catching-up`) with the error shown; the agent restarts it every minute, so it
 continues once the cause is fixed.
 
+`redis-shake` uses the same agent states. `full-load` covers the preflight and
+the snapshot RedisShake loads (progress is the snapshot bytes applied, summed
+over the source shards); then `catching-up` until the heartbeat lag is 15s or
+less. RedisShake cannot resume a run: when it stops on a lost connection or a
+restart, the worker empties the target and copies again from the beginning,
+and the phase goes back to `full-load` with the reason in the message.
+
 ### Allowed actions
 
 The backend computes `allowedActions` so the UI does not duplicate engine rules.
 
 | Action | Allowed when |
 | --- | --- |
-| `pause` | `catching-up`, `replicating` (PCSM can only pause change replication) |
+| `pause` | `catching-up`, `replicating`, for engines whose descriptor sets `canPause` (PCSM can only pause change replication; `redis-shake` cannot pause) |
 | `resume` | `paused`, `failed` |
 | `cutover` | `replicating`, or `paused` with the initial sync complete |
 | `delete` | always (the UI asks for confirmation unless the migration is `completed`/`failed`) |
@@ -304,7 +314,8 @@ upstream or worker failure).
       "displayName": "Percona ClusterSync for MongoDB",
       "sourceDatabaseTypes": ["mongodb"],
       "targetDatabaseTypes": ["mongodb"],
-      "targetProviders": ["percona-server-mongodb"]
+      "targetProviders": ["percona-server-mongodb"],
+      "canPause": true
     }
   ]
 }
@@ -473,6 +484,46 @@ and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
   the source and the target (both engines check this: a replica ignores
   changes carrying its own `server_id`).
 
+### Redis / Valkey engine options (`engine: "redis-shake"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `flushTarget` | `bool` | `false` | Delete every key on the target before the copy. Otherwise a target with keys fails the preflight. |
+| `excludeKeyPrefixes` | `string[]` (≤ 64) | `[]` | Keys starting with these are neither copied nor replicated. Applied in RedisShake's Lua hook, not `block_key_prefix`, which silently drops a whole command when only some of its keys match; a command that changes both excluded and migrated keys (other than `MSET`/`MSETNX`/`DEL`/`UNLINK`, which are split) stops the migration. `__openeverest_migration:` is reserved. |
+
+Sources are external `redis[s]://` / `valkey[s]://` URIs (a standalone
+primary or any primary of a cluster) or `valkey` instances. Targets are
+`valkey` instances, always clusters (provider-valkey runs Valkey in cluster
+mode, also for its `replication` topology). The worker:
+
+- **Preflight**: the source is a primary; both clusters report `cluster_state:ok`;
+  the source has keys only in database 0; no hashes with field expiration
+  between different server types (Redis `subexpiry`, Valkey
+  `keys_with_volatile_items`); the target is empty unless `flushTarget`; the
+  source and target `run_id`s differ.
+- **Copy and replication**: RedisShake 4.7 (`sync_reader` → `redis_writer`,
+  cluster mode as detected) with `rdb_restore_command_behavior = "rewrite"`.
+  A Lua hook stops the migration on writes to another database and drops
+  `PUBLISH`.
+- **Heartbeat**: one key for every pair of a source shard and a target shard
+  that share slots (`__openeverest_migration:{tag}:<name>:heartbeat`, the tag
+  picking a shared slot), set to the source clock every 5s. RedisShake sends
+  one source shard's changes for one target shard over one ordered
+  connection, so a heartbeat on the target proves everything sent before it
+  in that pair was applied. Lag is the age of the oldest heartbeat not yet on
+  the target.
+- **State**: `__openeverest_migration:<name>:state` on the target (`copying`,
+  `failed` with the reason, `stopped`, `completed`). A restarted worker copies
+  again only from `copying`; `failed` waits for a resume, and `stopped` (the
+  cutover had stopped RedisShake) only finishes the cleanup. Only once the
+  state exists does the worker empty the target on its own; a migration that
+  failed its preflight runs it again on resume.
+- **Cutover**: writes a final heartbeat, newer than every earlier one, into
+  every shard pair and waits until the target has all of them (at most 15
+  minutes), so every change made before the request is applied even while
+  the source keeps taking writes. It then stops RedisShake and removes the
+  heartbeat keys on both sides.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -506,6 +557,9 @@ and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
   the plugin).
 - `engines.mariadb-replication.enabled` and `engines.mariadb-replication.image`
   (the same image as `mysql-replication`).
+- `engines.redis-shake.enabled` and `engines.redis-shake.image`
+  (`ghcr.io/openeverest/plugin-migrations-redis-shake`, with RedisShake 4.7.0,
+  released with the plugin).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
@@ -576,6 +630,21 @@ and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
     Replication-topology targets need the operator to keep a migration
     connection across restarts and switchovers. Grants through roles are not
     seen by the source privilege check (`SHOW GRANTS` of the user only).
+14. **Redis/Valkey: no resume.** RedisShake 4 restarts from a full snapshot
+    after any interruption, and each attempt makes every source shard fork for
+    a snapshot; the worker gives up after 5 failed copies in a row. Resuming
+    is possible in principle (`PSYNC <replid> <offset>` continues, also across
+    a source failover), but applying replayed commands exactly once needs a
+    per-slot checkpoint written in the same transaction as the data, which
+    RedisShake does not do (cluster targets reject cross-slot transactions).
+15. **Redis/Valkey: stock RedisShake 4.7 limits.** It does not verify server
+    certificates (the worker's own checks do), and it cannot copy hashes with
+    field expiration between Redis 8 and Valkey 9, so the preflight refuses
+    such sources. Both are fixed upstream in tair-opensource/RedisShake#1075
+    and #1074 (pending). Module types (RedisJSON, Bloom, …) cannot be copied
+    to Valkey. Commands whose keys hash to different slots are split when the
+    keys are independent (`MSET`, `MSETNX`, `DEL`, `UNLINK`); others stop the
+    migration with a message.
 
 ## 12. Roadmap
 
@@ -592,5 +661,8 @@ and myloader's threads. The same worker runs with `FLAVOR=mariadb`:
   then attach the replication channel) for large databases, which needs
   provider support; Percona Server (Group Replication) targets; MariaDB
   replication-topology targets.
+- Redis/Valkey: resumable runs (per-slot checkpoints, upstream in RedisShake
+  or in the worker), and the RedisShake fixes for TLS verification and field
+  expiration once released.
 - Cross-engine migrations (for example with Debezium Server and its JDBC sink).
 - Optional Migration CRD and controller for GitOps.

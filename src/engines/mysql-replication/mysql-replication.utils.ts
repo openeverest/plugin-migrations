@@ -1,4 +1,5 @@
 import { isRecord, readBoolean, readNumber, readStringArray } from '../../utils/guards.utils';
+import { validateSingleHostUri } from '../../utils/uri.utils';
 import type { EngineOptionsErrors, OptionSummaryItem } from '../engine.types';
 import { COPY_THREADS, MYSQL_URI_SCHEMES, NAME_PATTERN, SYSTEM_DATABASES } from './mysql-replication.constants';
 import { Messages } from './mysql-replication.messages';
@@ -82,21 +83,6 @@ export function summarizeMysqlReplicationOptions(options: unknown): OptionSummar
   ];
 }
 
-/** Validates a single-host URI with one of schemes (e.g. "mysql://"). */
-export function validateMysqlCompatibleUri(uri: string, schemes: readonly string[]): string | undefined {
-  const trimmed = uri.trim();
-  if (trimmed === '') return Messages.uriRequired;
-  const scheme = schemes.find((candidate) => trimmed.toLowerCase().startsWith(candidate));
-  if (scheme === undefined) return Messages.uriScheme(schemes);
-  const rest = trimmed.slice(scheme.length);
-  const authorityEnd = rest.search(/[/?#]/);
-  const authority = authorityEnd < 0 ? rest : rest.slice(0, authorityEnd);
-  const hosts = authority.slice(authority.lastIndexOf('@') + 1);
-  if (hosts.trim() === '') return Messages.uriHost;
-  if (hosts.includes(',')) return Messages.uriMultiHost;
-  return undefined;
-}
-
 export function validateMysqlUri(uri: string): string | undefined {
-  return validateMysqlCompatibleUri(uri, MYSQL_URI_SCHEMES);
+  return validateSingleHostUri(uri, MYSQL_URI_SCHEMES);
 }

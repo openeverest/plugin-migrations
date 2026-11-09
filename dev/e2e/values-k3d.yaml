@@ -27,3 +27,8 @@ engines:
       repository: plugin-migrations-mysql-replication
       tag: e2e
       pullPolicy: Never
+  redis-shake:
+    image:
+      repository: plugin-migrations-redis-shake
+      tag: e2e
+      pullPolicy: Never

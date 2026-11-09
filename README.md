@@ -7,8 +7,10 @@ keeps the target in sync with ongoing changes (**CDC**), and you trigger
 
 > **Status: v0.1 draft.** Engines: **MongoDB → MongoDB** built on
 > [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
-> (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication, and
-> **MySQL → MySQL** and **MariaDB → MariaDB** built on native GTID replication.
+> (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication,
+> **MySQL → MySQL** and **MariaDB → MariaDB** built on native GTID replication,
+> and **Redis / Valkey → Valkey** built on
+> [RedisShake](https://github.com/tair-opensource/RedisShake).
 > The plugin appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
@@ -38,7 +40,8 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
    catalog work; PostgreSQL: sequences, materialized views, and removing the
    replication slot and publication from the source; MySQL and MariaDB:
    waiting for the source's GTID position, removing the replication channel,
-   and enabling events).
+   and enabling events; Redis/Valkey: waiting until the target has every
+   change and stopping RedisShake).
 4. **Delete**: removes the worker. Data on the target is kept. Engines that
    leave replication state behind (PostgreSQL) clean it up first.
 
@@ -57,6 +60,7 @@ position).
 | `postgres-logical` | PostgreSQL 13+ (OpenEverest instance or external URI) | OpenEverest `percona-postgresql` instance (PostgreSQL 15+) | `ghcr.io/openeverest/plugin-migrations-postgres-logical` |
 | `mysql-replication` | MySQL 8.0+ / Percona Server / PXC (OpenEverest `percona-xtradb-cluster` instance or external URI) | OpenEverest `percona-xtradb-cluster` instance (8.0.23+) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` |
 | `mariadb-replication` | MariaDB 10.6+ (OpenEverest `mariadb` instance or external URI) | OpenEverest `mariadb` standalone or Galera instance (10.11+, provider-mariadb 0.2.2+) | same image as `mysql-replication` |
+| `redis-shake` | Redis 2.8+ / Valkey, standalone or cluster (OpenEverest `valkey` instance or external URI) | OpenEverest `valkey` instance | `ghcr.io/openeverest/plugin-migrations-redis-shake` |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
@@ -83,13 +87,21 @@ replicates over a named MariaDB replication connection
 (`MASTER_USE_GTID=slave_pos`). It connects to OpenEverest instances with the
 admin (root) connection provider-mariadb publishes.
 
+`redis-shake` migrates every key of database 0, standalone or cluster.
+RedisShake copies a snapshot through the source's replication protocol, then
+applies the changes the source streams. Options: key prefixes to exclude and
+*delete all keys on the target*. It cannot pause, and an interrupted run
+starts again from the beginning. See
+[workers/redis-shake/README.md](workers/redis-shake/README.md).
+
 ### Adding an engine
 
 1. Backend: implement `engine.Engine` in `backend/internal/engine/<id>/`
    (`Prepare` builds the worker spec; `Controller` drives the running worker
    and maps its state onto the shared phases; workers built on the agent API
-   in `workers/` reuse `engine/agentclient`). Register its constructor in
-   `compiledEngines` in `backend/main.go`.
+   in `workers/` reuse `engine/agentclient`; set `CanPause` in the descriptor
+   when a migration can be paused and resumed where it stopped). Register its
+   constructor in `compiledEngines` in `backend/main.go`.
 2. Helm: add `engines.<id>` (enabled flag and image) to `values.yaml`.
 3. Frontend: add `src/engines/<id>/` (label, compatible providers, default
    options, options form) and register it in `src/engines/index.ts`.
@@ -117,6 +129,8 @@ Then open **Migrations** in the OpenEverest sidebar.
 | `engines.mysql-replication.image.*` | MySQL worker image | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
 | `engines.mariadb-replication.enabled` | Enable the MariaDB replication engine | `true` |
 | `engines.mariadb-replication.image.*` | MariaDB worker image (the MySQL worker image) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
+| `engines.redis-shake.enabled` | Enable the Redis / Valkey engine | `true` |
+| `engines.redis-shake.image.*` | Redis / Valkey worker image | `ghcr.io/openeverest/plugin-migrations-redis-shake` (chart version) |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
@@ -209,6 +223,32 @@ MariaDB (`mariadb-replication`):
   node the migration replicated into); the other nodes show them as
   `SLAVESIDE_DISABLED`, as for any event created on a Galera node.
 
+Redis / Valkey (`redis-shake`):
+
+- Source: Redis 2.8+ or Valkey, standalone (the primary) or a cluster (any
+  primary). The user needs `PSYNC` (replication) and must be able to write a
+  heartbeat key. Only database 0 can be migrated: a Valkey cluster has no
+  other databases, and a later write to another database stops the migration.
+- Target: an OpenEverest `valkey` instance (always a cluster). It must be
+  empty, or enable *Delete all keys on the target*.
+- **No pause, no resume of an interrupted run.** RedisShake cannot continue a
+  stopped run: after a lost connection, a failover or a worker restart the
+  worker empties the target and copies everything again (each time the source
+  forks for a snapshot). After 5 failed copies in a row the migration fails;
+  check the source's `client-output-buffer-limit replica` and `repl-timeout`
+  and resume.
+- Multi-key commands whose keys hash to different slots are split when the
+  keys are independent (`MSET`, `MSETNX`, `DEL`, `UNLINK`); others (for
+  example a cross-slot `RENAME` or `SUNIONSTORE`) stop the migration.
+- Not copied: ACL users, configuration, Pub/Sub messages. Module data types
+  (RedisJSON, Bloom, TimeSeries, …) cannot be migrated to Valkey. Hashes with
+  field expiration can be migrated between servers of the same type (Redis 8
+  → Redis 8, Valkey 9 → Valkey 9) only, until a fixed RedisShake is released.
+- RedisShake encrypts its connections but does not verify server
+  certificates; the worker's own checks do when a CA is provided.
+- The worker stores the snapshot and the changes received during the copy on
+  its local disk: plan ephemeral storage for the source's dataset size.
+
 ## Development
 
 ```bash
@@ -217,6 +257,7 @@ make frontend     # tsc + vite build (dist/main.js) + vitest
 make backend      # gofmt + go vet + go test + go build
 (cd workers/postgres-logical && go test ./...)   # PostgreSQL worker agent
 (cd workers/mysql-replication && go test ./...)  # MySQL and MariaDB worker agent
+(cd workers/redis-shake && go test ./...)        # Redis / Valkey worker agent
 make helm-lint
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```

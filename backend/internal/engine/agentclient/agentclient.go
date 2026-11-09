@@ -1,6 +1,7 @@
 // Package agentclient drives the migration agents built in this repository
-// (workers/postgres-logical, workers/mysql-replication). They share one HTTP
-// API: GET /status, POST /start, /pause, /resume, /cutover and /teardown.
+// (workers/postgres-logical, workers/mysql-replication, workers/redis-shake).
+// They share one HTTP API: GET /status, POST /start, /pause, /resume,
+// /cutover and /teardown.
 package agentclient
 
 import (

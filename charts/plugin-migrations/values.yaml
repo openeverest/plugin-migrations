@@ -88,6 +88,16 @@ engines:
       repository: ghcr.io/openeverest/plugin-migrations-mysql-replication
       tag: "0.1.0"
       pullPolicy: IfNotPresent
+  # Redis or Valkey → Valkey (provider-valkey targets) with RedisShake: a
+  # snapshot through the replication protocol, then ongoing changes. The
+  # worker image bundles RedisShake: see workers/redis-shake. Released
+  # together with the plugin.
+  redis-shake:
+    enabled: true
+    image:
+      repository: ghcr.io/openeverest/plugin-migrations-redis-shake
+      tag: "0.1.0"
+      pullPolicy: IfNotPresent
 
 # Applied to every migration worker.
 worker:

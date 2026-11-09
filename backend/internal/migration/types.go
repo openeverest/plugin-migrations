@@ -154,6 +154,8 @@ type observation struct {
 	at     time.Time
 	// workerReady is false when no worker can act, so only delete is allowed.
 	workerReady bool
+	// canPause comes from the engine: some cannot continue a stopped run.
+	canPause bool
 }
 
 func newView(record Record, observed observation) View {
@@ -180,7 +182,9 @@ func allowedActions(observed observation) []Action {
 	actions := make([]Action, 0, 3)
 	switch status.Phase {
 	case engine.PhaseCatchingUp, engine.PhaseReplicating:
-		actions = append(actions, ActionPause)
+		if observed.canPause {
+			actions = append(actions, ActionPause)
+		}
 	case engine.PhasePaused, engine.PhaseFailed:
 		actions = append(actions, ActionResume)
 	}

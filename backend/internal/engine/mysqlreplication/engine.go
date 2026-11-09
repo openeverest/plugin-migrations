@@ -100,6 +100,7 @@ func (e *Engine) Describe() engine.Descriptor {
 		SourceDatabaseTypes: []string{databaseTypeMySQL},
 		TargetDatabaseTypes: []string{databaseTypeMySQL},
 		TargetProviders:     slices.Clone(e.variant.targetProviders),
+		CanPause:            true,
 	}
 }
 

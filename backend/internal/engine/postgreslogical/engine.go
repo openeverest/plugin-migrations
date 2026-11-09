@@ -65,6 +65,7 @@ func (e *Engine) Describe() engine.Descriptor {
 		SourceDatabaseTypes: []string{databaseTypePostgreSQL},
 		TargetDatabaseTypes: []string{databaseTypePostgreSQL},
 		TargetProviders:     slices.Clone(targetProviders),
+		CanPause:            true,
 	}
 }
 

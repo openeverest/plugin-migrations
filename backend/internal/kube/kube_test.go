@@ -172,6 +172,65 @@ func TestWorkloadsApply(t *testing.T) {
 	}
 }
 
+func TestWorkloadsVolume(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+	record, err := NewStore(client, testNamespace).Create(ctx, testRecord())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workloads := NewWorkloads(client, testNamespace, WorkerConfig{StorageClassName: "fast"})
+	worker := engine.WorkerSpec{
+		Image: "worker:1", ImagePullPolicy: "IfNotPresent", Port: 2243, HealthPath: "/healthz",
+		Volume: &engine.Volume{SizeGiB: 20, MountPath: "/data", FSGroup: 65532},
+	}
+	if err := workloads.Apply(ctx, record, worker); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, "mig-abc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size := claim.Spec.Resources.Requests[corev1.ResourceStorage]; size.String() != "20Gi" {
+		t.Fatalf("volume size = %s", size.String())
+	}
+	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != "fast" || claim.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Fatalf("unexpected claim spec: %+v", claim.Spec)
+	}
+	if len(claim.OwnerReferences) != 1 || claim.OwnerReferences[0].Name != "mig-abc" {
+		t.Fatalf("volume not owned by the record: %+v", claim.OwnerReferences)
+	}
+	deployment, err := client.AppsV1().Deployments(testNamespace).Get(ctx, "mig-abc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := deployment.Spec.Template.Spec
+	if len(pod.Volumes) != 1 || pod.Volumes[0].PersistentVolumeClaim == nil || pod.Volumes[0].PersistentVolumeClaim.ClaimName != "mig-abc" {
+		t.Fatalf("volume not attached: %+v", pod.Volumes)
+	}
+	if mounts := pod.Containers[0].VolumeMounts; len(mounts) != 1 || mounts[0].MountPath != "/data" {
+		t.Fatalf("volume not mounted: %+v", mounts)
+	}
+	if pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 65532 {
+		t.Fatalf("fsGroup = %v", pod.SecurityContext.FSGroup)
+	}
+
+	// Without a volume nothing is claimed and the default class stays unset.
+	other := testRecord()
+	other.ID = "mig-def"
+	other, err = NewStore(client, testNamespace).Create(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.Volume = nil
+	if err := NewWorkloads(client, testNamespace, WorkerConfig{}).Apply(ctx, other, worker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, "mig-def", metav1.GetOptions{}); err == nil {
+		t.Fatal("no volume may be claimed without engine.Volume")
+	}
+}
+
 func TestWorkloadsBootstrapGatesWorker(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewSimpleClientset()

@@ -19,8 +19,9 @@ built on
 native GTID replication (`mysql-replication`, `mariadb-replication`),
 **Redis / Valkey → Valkey** built on
 [RedisShake](https://github.com/tair-opensource/RedisShake) (`redis-shake`),
-and **SQL Server → SQL Server** built on log shipping through S3
-(`mssql-log-shipping`).
+**SQL Server → SQL Server** built on log shipping through S3
+(`mssql-log-shipping`), and **MySQL → TiDB** built on
+[TiDB Data Migration](https://docs.pingcap.com/tidb/stable/dm-overview/) (`tidb-dm`).
 
 ## 1. Goals and non-goals (v0.1)
 
@@ -81,8 +82,10 @@ Backend layers (Go, `backend/internal/...`):
 | `engine/mysqlreplication` | MySQL and MariaDB engines (one worker image, `FLAVOR` env): option validation, worker spec (source/target URIs normalized to `ssl-mode`, CA files; provider-mariadb admin connections), teardown. | `engine`, `engine/agentclient` |
 | `engine/redisshake` | Redis/Valkey engine: option validation, worker spec (redis[s]:// URIs, CA and provider-valkey client certificate files), teardown. Declares `CanPause: false`. | `engine`, `engine/agentclient` |
 | `engine/mssqllogshipping` | SQL Server engine: option validation, worker spec (sqlserver:// URIs, CA files, the BackupStorage's endpoint, credentials and CA), teardown. Declares `RequiresBackupStorage`. | `engine`, `engine/agentclient` |
+| `engine/tidbdm` | MySQL → TiDB engine: option validation, worker spec (source/target URIs, CA files, the worker volume for DM's dump and state), teardown. | `engine`, `engine/agentclient`, `engine/mysqluri` |
+| `engine/mysqluri` | MySQL connection URIs shared by `mysqlreplication` and `tidbdm`: parsing, `tls`/`ssl-mode` normalization, the worker URI and CA files. | `engine` |
 | `migration` | Domain service: create/list/get/act/delete, authorization, endpoint and backup storage resolution, allowed actions, background reconciler. | `engine`, `Store`/`Workloads`/`Everest`/`Secrets` interfaces |
-| `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service) owned by the record; reads a BackupStorage's credentials Secret. | Kubernetes, `migration` types |
+| `kube` | ConfigMap-backed record store plus the worker objects (Secret/Deployment/Service, and a PVC for engines that ask for a volume) owned by the record; reads a BackupStorage's credentials Secret. | Kubernetes, `migration` types |
 | `everest` | OpenEverest API client using the caller's JWT (instances, access check, connection details, backup storages). | HTTP |
 | `api` | HTTP handlers, request decoding, error mapping. | `migration` |
 
@@ -126,8 +129,10 @@ BackupStorage the user picked in the target's namespace, with its S3
 endpoint, bucket, region, addressing style, credentials and optional CA
 (`engine.BackupStorage`). It returns:
 
-- `WorkerSpec`: container port, health path, env, secret data, secret env and
-  secret files (TLS CAs). Credentials appear only in the secret fields.
+- `WorkerSpec`: container port, health path, env, secret data, secret env,
+  secret files (TLS CAs) and an optional `Volume` (size in GiB, mount path and
+  the `fsGroup` that lets the image's non-root user write it). Credentials
+  appear only in the secret fields.
 - `Snapshot`: effective options after defaults. It is shown in the UI and
   persisted, so it **must not** contain credentials.
 
@@ -215,6 +220,15 @@ source's clock, of the start of the oldest database's last restored backup.
 A failing backup or restore is retried with the error in the status; a broken
 log chain fails the migration for good.
 
+`tidb-dm` uses the same agent states. `full-load` covers the preflight
+(including DM's precheck, run with `dmctl check-task`; the task then starts
+with `ignore-checking-items: ["all"]`), DM's dump (progress: bytes dumped of the source's
+estimated size) and its load (bytes loaded of the dump); then `catching-up`
+until the replicated heartbeat lag is 15s or less. A subtask DM paused on an
+error shows DM's message while DM retries it on its own; after two minutes
+(at once for DDL TiDB cannot parse) the migration is `failed` and **Resume**
+resumes the task.
+
 ### Allowed actions
 
 The backend computes `allowedActions` so the UI does not duplicate engine rules.
@@ -247,7 +261,8 @@ data:
 ```
 
 The ConfigMap **owns** (through `ownerReferences`) the migration's Secret
-(source/target URIs and CAs), Deployment (worker) and Service. Deleting the
+(source/target URIs and CAs), Deployment (worker) and Service, and the
+worker's PersistentVolumeClaim when the engine asks for a volume (`tidb-dm`). Deleting the
 record deletes the whole migration through Kubernetes garbage collection.
 Updates use `resourceVersion` optimistic concurrency.
 
@@ -297,7 +312,8 @@ it later (for GitOps) without changing the domain service.
    source slot and publication, and the heartbeat tables; MySQL: remove the
    replication channel and the `openeverest_migration` databases; SQL
    Server: drop the S3 credentials, the bucket's objects and the state
-   tables). A failed teardown
+   tables; TiDB: remove DM's task and source, DM's checkpoints and the
+   heartbeat databases). A failed teardown
    returns 502 and keeps the record, so nothing is left retaining WAL
    silently; `?force=true` skips it when the source no longer exists. Then
    delete the ConfigMap. The worker stops and data already written to the
@@ -315,7 +331,8 @@ it later (for GitOps) without changing the domain service.
   require `read-connection` on the target (and on a managed source), which is
   a stronger permission than reading.
 - The backend ServiceAccount is limited to ConfigMaps, Secrets, Services,
-  Deployments, bootstrap Jobs and listing Pods in the workload namespace.
+  PersistentVolumeClaims, Deployments, bootstrap Jobs and listing Pods in the
+  workload namespace.
   When `mssql-log-shipping` is enabled it may also `get` Secrets in any
   namespace (a ClusterRole), to read the credentials of the BackupStorage a
   user picked after the OpenEverest API confirmed the user can read that
@@ -616,6 +633,61 @@ URLs) and the target must not be older than the source. The worker:
   secondary, the worker moves to the new primary and copies the databases
   again, unless the cutover's final backups were taken.
 
+### TiDB engine options (`engine: "tidb-dm"`)
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `databases` | `string[]` | database in the source URI | Required for instance sources. Databases keep their names on TiDB. System databases, `dm_meta`, `lightning_task_info`, `openeverest_migration` and `openeverest_mig_*` cannot be migrated. |
+| `excludeTables` | `string[]` (`database.table`) | `[]` | Neither dumped nor replicated (DM `ignore-tables`). Must belong to a migrated database. |
+| `recreateDatabases` | `bool` | `false` | Drop the databases on TiDB first. Otherwise a database that has tables fails the preflight. |
+| `storageGiB` | `int` (1–16384) | `10` | Size of the worker's volume, which holds DM's dump until it is loaded and DM's own state. |
+| `copyThreads` | `int` (1–32) | `4` | Dumpling threads and the load's pool size. |
+| `syncThreads` | `int` (1–64) | `16` | DM's `worker-count`: changes applied concurrently. |
+
+The worker ([workers/tidb-dm](../workers/tidb-dm/README.md)) runs dm-master
+and dm-worker as child processes, with their state on the volume, and drives
+them through dm-master's HTTP gateway (`dmctl` only for the precheck):
+
+- **Preflight** lists every problem at once: its own checks (MySQL 5.7–8.4,
+  not MariaDB or TiDB; binary log settings; databases exist; collations
+  TiDB has; no spatial columns; no foreign keys with `CASCADE`/`SET NULL`
+  actions, whose changes MySQL does not log; the target is TiDB with no
+  tables in the databases; the source's data fits the volume) and DM's
+  precheck (privileges and the rest).
+- **Task**: `task-mode: all`, `collation_compatible: strict`, a
+  block-allow list of the databases plus the migration's heartbeat database
+  (`do-dbs`) and the excluded tables (`ignore-tables`; DM ignores
+  `ignore-tables` for tables `do-tables` match, so `do-tables` is not used),
+  `checkpoint-flush-interval: 5`. DM follows the source by GTID when
+  `gtid_mode=ON`, otherwise by file and position.
+- **State**: `openeverest_migration.dm_state` on TiDB (phase `preflight`,
+  `copying`, `replicating`, `completed`; options; paused; the agent's own
+  failure). Preflight failures are recorded too, so a restarted worker waits
+  for a resume instead of starting again. DM's checkpoints are in
+  `dm_meta.<task>_*` on TiDB and its task in dm-master's etcd on the volume:
+  a restarted pod continues where DM stopped, the load included. If the
+  volume is lost, the agent recreates the task (without DM's precheck,
+  which passed already): DM continues from its checkpoints once its load
+  finished (`dm_meta.<task>_lightning_checkpoint_list`) and copies from the
+  beginning when the load never began; a load interrupted with its dump
+  fails the migration.
+- **Heartbeat**: `openeverest_mig_<id>.heartbeat` on the source, replicated
+  by DM; lag is the source's clock minus the replicated value.
+- **Views**: DM neither dumps nor replicates views. The agent creates them on
+  TiDB from `SHOW CREATE VIEW` (definer `CURRENT_USER`) once replication runs
+  and again at the cutover; views TiDB rejects are listed in the notes.
+- **DDL TiDB cannot parse**: DM parses every DDL before filtering, so such a
+  statement stops the task even for a database that is not migrated. The
+  agent reads the event with `SHOW BINLOG EVENTS` and skips it
+  (`handle-error skip` at its position) only when it creates or alters a
+  table or database outside the migration and names no migrated database.
+- **Cutover**: reads the source's binary log position and GTID set, then
+  waits until DM's *saved* checkpoint (`syncerBinlog`/`syncerBinlogGtid` of
+  the status, which DM writes only after every earlier change was applied)
+  reaches it; the heartbeat keeps events flowing so checkpoints advance.
+  Then it creates the views, removes DM's task and source, and drops the
+  heartbeat databases and DM's checkpoints. A failed cutover can be resumed.
+
 ## 9. UI (sidebar only in v0.1)
 
 - **Migrations list** at `/plugins/plugin-migrations`: a table with name,
@@ -657,10 +729,13 @@ URLs) and the target must not be older than the source. The worker:
   (`ghcr.io/openeverest/plugin-migrations-mssql-log-shipping`, released with
   the plugin). Enabling it adds a ClusterRole that lets the backend `get`
   Secrets (BackupStorage credentials).
+- `engines.tidb-dm.enabled` and `engines.tidb-dm.image`
+  (`ghcr.io/openeverest/plugin-migrations-tidb-dm`, with DM v8.5.8, released
+  with the plugin).
 - `workload.namespace` (defaults to the release namespace) holds the records and
   workers. The chart includes a Role and RoleBinding for that namespace.
 - `worker.resources`, `worker.nodeSelector` and `worker.tolerations` apply to
-  all workers.
+  all workers; `worker.storageClassName` to worker volumes.
 - Plugin CR extension points: `route` and `sidebarItem` only. Permissions:
   `read namespaces`, `read instances`, `read-connection instances`,
   `read backup-storages`.
@@ -763,6 +838,23 @@ URLs) and the target must not be older than the source. The worker:
     OpenEverest API returns none. An API endpoint for plugins (or a scoped
     token) would remove it. SQL Server always verifies the storage's TLS
     certificate, so a private CA must be mounted on both servers.
+19. **TiDB: the dump needs disk.** DM has no streaming copy: dumpling writes
+    the snapshot to the worker's volume, then the load reads it. The volume is
+    sized by the user and checked against the source's table sizes. Large
+    databases should use DM's physical import (`import-mode: physical`,
+    Lightning's local backend), which needs the worker to reach PD and TiKV
+    and a sorting directory, or a dump directory on S3 (see the roadmap).
+20. **TiDB: statements TiDB cannot run.** A DDL TiDB cannot parse or apply on
+    a migrated table stops DM; the migration cannot get past it without
+    `handle-error`, which the UI does not offer. Users must make the source
+    compatible and create the migration again. Foreign keys with referential
+    actions are refused because DM applies changes with
+    `foreign_key_checks=0` (DM 8.5.6+ can enforce them experimentally).
+21. **TiDB: source TLS.** DM either verifies the server (CA and host name) or
+    connects without TLS, so `ssl-mode=REQUIRED` without a CA is refused and
+    `PREFERRED` connects without TLS.
+22. **TiDB: provider connection details.** The backend needs a connection
+    `uri`; provider-tidb publishes it from 0.2.4.
 
 ## 12. Roadmap
 
@@ -785,5 +877,10 @@ URLs) and the target must not be older than the source. The worker:
 - Redis/Valkey: resumable runs (per-slot checkpoints, upstream in RedisShake
   or in the worker), and the RedisShake fixes for TLS verification and field
   expiration once released.
+- TiDB: a large-database mode with DM's physical import (Lightning local
+  backend into TiKV) or a dump on S3, following PingCAP's
+  [large MySQL to TiDB](https://docs.pingcap.com/tidb/stable/migrate-large-mysql-to-tidb/)
+  guide; a "skip this statement" action for DDL TiDB cannot run; sharded
+  sources merged into one TiDB table (DM's shard merge).
 - Cross-engine migrations (for example with Debezium Server and its JDBC sink).
 - Optional Migration CRD and controller for GitOps.

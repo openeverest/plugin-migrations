@@ -1,0 +1,32 @@
+# OpenEverest TiDB target (provider-tidb): one PD, one TiKV and one TiDB.
+# Its connection details point at the TiDB Service and publish root.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: orders-tidb
+  namespace: shop
+spec:
+  providerRef:
+    name: tidb
+  version: "8.5.2"
+  topology:
+    type: cluster
+  components:
+    pd:
+      type: pd
+      replicas: 1
+      storage:
+        size: 2Gi
+    tikv:
+      type: tikv
+      replicas: 1
+      storage:
+        size: 5Gi
+    tidb:
+      type: tidb
+      replicas: 1

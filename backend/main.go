@@ -29,6 +29,7 @@ import (
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/pcsm"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/postgreslogical"
 	"github.com/openeverest/plugin-migrations/backend/internal/engine/redisshake"
+	"github.com/openeverest/plugin-migrations/backend/internal/engine/tidbdm"
 	"github.com/openeverest/plugin-migrations/backend/internal/everest"
 	"github.com/openeverest/plugin-migrations/backend/internal/kube"
 	"github.com/openeverest/plugin-migrations/backend/internal/migration"
@@ -54,6 +55,7 @@ var compiledEngines = map[string]func() engine.Engine{
 	mysqlreplication.MariaDBID: mysqlreplication.NewMariaDB,
 	redisshake.ID:              redisshake.New,
 	mssqllogshipping.ID:        mssqllogshipping.New,
+	tidbdm.ID:                  tidbdm.New,
 }
 
 // engineConfig is one entry of the ENGINES JSON rendered from Helm values.
@@ -108,6 +110,7 @@ func workerConfigFromEnv() (kube.WorkerConfig, error) {
 			return kube.WorkerConfig{}, err
 		}
 	}
+	config.StorageClassName = strings.TrimSpace(os.Getenv("WORKER_STORAGE_CLASS_NAME"))
 	return config, nil
 }
 

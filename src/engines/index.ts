@@ -6,6 +6,7 @@ import { mysqlReplicationEngine } from './mysql-replication';
 import { pcsmEngine } from './pcsm';
 import { postgresLogicalEngine } from './postgres-logical';
 import { redisShakeEngine } from './redis-shake';
+import { tidbDmEngine } from './tidb-dm';
 
 export const ENGINES: readonly Engine[] = [
   pcsmEngine,
@@ -14,6 +15,7 @@ export const ENGINES: readonly Engine[] = [
   mariadbReplicationEngine,
   redisShakeEngine,
   mssqlLogShippingEngine,
+  tidbDmEngine,
 ];
 
 export function getEngine(id: string): Engine | undefined {

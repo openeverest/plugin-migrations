@@ -37,3 +37,8 @@ engines:
       repository: plugin-migrations-mssql-log-shipping
       tag: e2e
       pullPolicy: Never
+  tidb-dm:
+    image:
+      repository: plugin-migrations-tidb-dm
+      tag: e2e
+      pullPolicy: Never

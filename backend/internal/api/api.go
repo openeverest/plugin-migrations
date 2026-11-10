@@ -26,8 +26,10 @@ type MigrationService interface {
 	Delete(ctx context.Context, token, id string, force bool) error
 }
 
+// InstanceLister lists the OpenEverest resources the create form picks from.
 type InstanceLister interface {
 	ListInstances(ctx context.Context, token, k8sCluster string) ([]everest.InstanceSummary, error)
+	ListBackupStorages(ctx context.Context, token, k8sCluster, namespace string) ([]everest.BackupStorageSummary, error)
 }
 
 type API struct {
@@ -42,6 +44,7 @@ func New(migrations MigrationService, instances InstanceLister) *API {
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/status", a.handleStatus)
 	mux.HandleFunc("GET /api/instances", a.withToken(a.handleListInstances))
+	mux.HandleFunc("GET /api/backup-storages", a.withToken(a.handleListBackupStorages))
 	mux.HandleFunc("GET /api/migrations", a.withToken(a.handleListMigrations))
 	mux.HandleFunc("POST /api/migrations", a.withToken(a.handleCreateMigration))
 	mux.HandleFunc("GET /api/migrations/{id}", a.withToken(a.handleGetMigration))
@@ -90,6 +93,21 @@ func (a *API) handleListInstances(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"instances": instances})
+}
+
+func (a *API) handleListBackupStorages(w http.ResponseWriter, r *http.Request, token string) {
+	k8sCluster := strings.TrimSpace(r.URL.Query().Get("k8sCluster"))
+	namespace := strings.TrimSpace(r.URL.Query().Get("namespace"))
+	if k8sCluster == "" || namespace == "" {
+		writeError(w, http.StatusBadRequest, "k8sCluster and namespace are required")
+		return
+	}
+	storages, err := a.instances.ListBackupStorages(r.Context(), token, k8sCluster, namespace)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"backupStorages": storages})
 }
 
 func (a *API) handleListMigrations(w http.ResponseWriter, r *http.Request, token string) {

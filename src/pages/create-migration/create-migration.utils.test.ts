@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { InstanceSummary } from '../../api/instances.types';
+import { mssqlLogShippingEngine } from '../../engines/mssql-log-shipping';
+import { defaultMssqlLogShippingOptions } from '../../engines/mssql-log-shipping/mssql-log-shipping.utils';
 import { pcsmEngine } from '../../engines/pcsm';
 import { WIZARD_STEPS } from './create-migration.constants';
 import type { CreateMigrationDraft } from './create-migration.types';
@@ -12,8 +14,10 @@ import {
   filterTargetInstances,
   generateDefaultName,
   isStepValid,
+  selectEngine,
   validateName,
   withSourceInstance,
+  withTargetInstance,
 } from './create-migration.utils';
 
 const MONGO = 'percona-server-mongodb';
@@ -129,5 +133,52 @@ describe('buildReviewSummary', () => {
     const summary = buildReviewSummary(complete, buildWizardContext(complete, ENGINES, INSTANCES));
     expect(summary).toContainEqual({ label: 'Source', value: 'mongodb://admin:****@db1:27017' });
     expect(JSON.stringify(summary)).not.toContain('hunter2');
+  });
+});
+
+describe('backup storage', () => {
+  const sqlOrders: InstanceSummary = { k8sCluster: 'main', namespace: 'shop', name: 'sql-orders', provider: 'mssql' };
+  const sqlLegacy: InstanceSummary = { k8sCluster: 'main', namespace: 'legacy', name: 'sql-legacy', provider: 'mssql' };
+  const engines = [pcsmEngine, mssqlLogShippingEngine];
+  const instances = [sqlOrders, sqlLegacy];
+
+  function mssqlDraft(overrides: Partial<CreateMigrationDraft> = {}): CreateMigrationDraft {
+    return {
+      ...selectEngine(draft(), mssqlLogShippingEngine),
+      sourceKind: 'instance',
+      sourceInstanceKey: 'main/legacy/sql-legacy',
+      targetInstanceKey: 'main/shop/sql-orders',
+      options: { ...defaultMssqlLogShippingOptions(), databases: ['shop'] },
+      ...overrides,
+    };
+  }
+
+  it('requires a storage for engines that stage backups', () => {
+    const missing = mssqlDraft();
+    const context = buildWizardContext(missing, engines, instances);
+    expect(isStepValid('target', missing, context)).toBe(false);
+    expect(buildCreateRequest(missing, context, WIZARD_STEPS)).toBeUndefined();
+
+    const complete = mssqlDraft({ backupStorageName: 'minio' });
+    const request = buildCreateRequest(complete, buildWizardContext(complete, engines, instances), WIZARD_STEPS);
+    expect(request?.backupStorage).toEqual({ name: 'minio' });
+    expect(buildReviewSummary(complete, buildWizardContext(complete, engines, instances))).toContainEqual({
+      label: 'Backup storage',
+      value: 'minio',
+    });
+  });
+
+  it('does not send a storage for other engines', () => {
+    const complete = draft({ externalUri: 'mongodb://db1:27017', targetInstanceKey: 'main/shop/orders', backupStorageName: 'x' });
+    const request = buildCreateRequest(complete, buildWizardContext(complete, ENGINES, INSTANCES), WIZARD_STEPS);
+    expect(request).toBeDefined();
+    expect(request?.backupStorage).toBeUndefined();
+  });
+
+  it('clears the storage when the target changes', () => {
+    const chosen = mssqlDraft({ backupStorageName: 'minio' });
+    expect(withTargetInstance(chosen, 'main/shop/sql-orders').backupStorageName).toBe('minio');
+    expect(withTargetInstance(chosen, 'main/legacy/sql-legacy').backupStorageName).toBe('');
+    expect(withSourceInstance(chosen, 'main/shop/sql-orders').backupStorageName).toBe('');
   });
 });

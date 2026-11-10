@@ -9,8 +9,9 @@ keeps the target in sync with ongoing changes (**CDC**), and you trigger
 > [Percona ClusterSync for MongoDB](https://github.com/percona/percona-clustersync-mongodb)
 > (PCSM), **PostgreSQL → PostgreSQL** built on native logical replication,
 > **MySQL → MySQL** and **MariaDB → MariaDB** built on native GTID replication,
-> and **Redis / Valkey → Valkey** built on
-> [RedisShake](https://github.com/tair-opensource/RedisShake).
+> **Redis / Valkey → Valkey** built on
+> [RedisShake](https://github.com/tair-opensource/RedisShake), and
+> **SQL Server → SQL Server** built on log shipping through S3.
 > The plugin appears in the OpenEverest **sidebar** only.
 
 Read [docs/architecture.md](docs/architecture.md) for the design, the engine
@@ -41,7 +42,8 @@ Browser ─▶ OpenEverest proxy ─▶ plugin backend ─▶ OpenEverest API (y
    replication slot and publication from the source; MySQL and MariaDB:
    waiting for the source's GTID position, removing the replication channel,
    and enabling events; Redis/Valkey: waiting until the target has every
-   change and stopping RedisShake).
+   change and stopping RedisShake; SQL Server: restoring a final log backup
+   and recovering the databases).
 4. **Delete**: removes the worker. Data on the target is kept. Engines that
    leave replication state behind (PostgreSQL) clean it up first.
 
@@ -61,6 +63,7 @@ position).
 | `mysql-replication` | MySQL 8.0+ / Percona Server / PXC (OpenEverest `percona-xtradb-cluster` instance or external URI) | OpenEverest `percona-xtradb-cluster` instance (8.0.23+) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` |
 | `mariadb-replication` | MariaDB 10.6+ (OpenEverest `mariadb` instance or external URI) | OpenEverest `mariadb` standalone or Galera instance (10.11+, provider-mariadb 0.2.2+) | same image as `mysql-replication` |
 | `redis-shake` | Redis 2.8+ / Valkey, standalone or cluster (OpenEverest `valkey` instance or external URI) | OpenEverest `valkey` instance | `ghcr.io/openeverest/plugin-migrations-redis-shake` |
+| `mssql-log-shipping` | SQL Server 2022+ (OpenEverest `mssql` instance or external URI) | OpenEverest `mssql` instance (2022+, standalone or availability group) | `ghcr.io/openeverest/plugin-migrations-mssql-log-shipping` |
 
 PCSM options include namespace include/exclude filters (`db`, `db.*`,
 `db.collection`), pausing once the initial sync completes, and clone/replication
@@ -94,13 +97,26 @@ applies the changes the source streams. Options: key prefixes to exclude and
 starts again from the beginning. See
 [workers/redis-shake/README.md](workers/redis-shake/README.md).
 
+`mssql-log-shipping` migrates one or more databases with log shipping
+through an OpenEverest **BackupStorage** (S3) you pick in the target's
+namespace: the source backs up each database to S3 and the target restores it
+`WITH NORECOVERY`, then a log backup is taken and restored every few seconds.
+The cutover restores a final log backup, taken after the request, and
+recovers the databases; with *Copy logins* it also creates the databases'
+SQL logins with the same SID and password. Options: the databases, *recreate
+the target databases*, *copy logins*, *leave the source databases
+restoring*, and the log backup interval. See
+[workers/mssql-log-shipping/README.md](workers/mssql-log-shipping/README.md).
+
 ### Adding an engine
 
 1. Backend: implement `engine.Engine` in `backend/internal/engine/<id>/`
    (`Prepare` builds the worker spec; `Controller` drives the running worker
    and maps its state onto the shared phases; workers built on the agent API
    in `workers/` reuse `engine/agentclient`; set `CanPause` in the descriptor
-   when a migration can be paused and resumed where it stopped). Register its
+   when a migration can be paused and resumed where it stopped, and
+   `RequiresBackupStorage` when it stages data in a BackupStorage: the backend
+   then resolves the one the user picks and passes it to `Prepare`). Register its
    constructor in `compiledEngines` in `backend/main.go`.
 2. Helm: add `engines.<id>` (enabled flag and image) to `values.yaml`.
 3. Frontend: add `src/engines/<id>/` (label, compatible providers, default
@@ -131,6 +147,8 @@ Then open **Migrations** in the OpenEverest sidebar.
 | `engines.mariadb-replication.image.*` | MariaDB worker image (the MySQL worker image) | `ghcr.io/openeverest/plugin-migrations-mysql-replication` (chart version) |
 | `engines.redis-shake.enabled` | Enable the Redis / Valkey engine | `true` |
 | `engines.redis-shake.image.*` | Redis / Valkey worker image | `ghcr.io/openeverest/plugin-migrations-redis-shake` (chart version) |
+| `engines.mssql-log-shipping.enabled` | Enable the SQL Server log shipping engine; also grants the backend `get` on Secrets cluster-wide, to read the chosen BackupStorage's credentials | `true` |
+| `engines.mssql-log-shipping.image.*` | SQL Server worker image | `ghcr.io/openeverest/plugin-migrations-mssql-log-shipping` (chart version) |
 | `workload.namespace` | Namespace for migration records and workers | release namespace |
 | `workload.createNamespace` | Let Helm create `workload.namespace` | `false` |
 | `worker.resources` | Resources for every worker | `500m`/`1Gi` requests, `4Gi` memory limit |
@@ -249,6 +267,46 @@ Redis / Valkey (`redis-shake`):
 - The worker stores the snapshot and the changes received during the copy on
   its local disk: plan ephemeral storage for the source's dataset size.
 
+SQL Server (`mssql-log-shipping`):
+
+- Source: SQL Server 2022+ (S3 backups need 2022), the databases in the FULL
+  recovery model, and a `sysadmin` user (it backs up the databases, creates
+  an S3 credential and reads `msdb` and the logins).
+- Target: an OpenEverest `mssql` instance (provider-mssql publishes `sa`),
+  the same or a newer version. The databases must not exist on the target, or
+  enable *Recreate the target databases*.
+- **Backup storage**: an S3 BackupStorage in the target's namespace. SQL
+  Server reaches S3 over HTTPS only and always verifies the certificate: with
+  a private CA, put it in the storage's credentials Secret as `ca.crt` and
+  attach the storage to the OpenEverest instances (provider-mssql then
+  mounts the CA); an external source must trust it itself. The plugin reads
+  the storage's credentials with its ServiceAccount once you proved you can
+  read the storage.
+- **The migration owns the databases' log chain.** Any other log backup (an
+  OpenEverest source's point-in-time recovery, a maintenance plan) takes log
+  records the target never gets: the preflight refuses sources with such
+  backups in the last 24 hours (enable *Other log backups are disabled* once
+  you turned them off), and a later one fails the migration, which must be
+  created again. The source keeps its log while the migration is paused.
+- The **source SQL Server and the target SQL Server** both reach the storage,
+  not only the worker.
+- Availability groups: a source database's backups follow its primary. On a
+  target availability group the databases are restored on the primary and,
+  after the cutover, the operator adds them to the group and seeds the
+  secondaries. If the target's primary moves before the cutover, the
+  databases are copied again to the new primary.
+- Logins are server objects: on an availability group source, a login that
+  exists only on another replica than the primary is not copied (the
+  migration's notes list such users).
+- Not copied: Windows logins, server roles and permissions, SQL Agent jobs,
+  linked servers and other server objects. Encrypted (TDE) databases need
+  their certificate on the target first.
+- Deleting a migration that did not complete leaves its databases restoring
+  on the target: drop them or recover them (`RESTORE DATABASE … WITH
+  RECOVERY`). With *Leave the source databases restoring*, bring a source
+  database back with `RESTORE DATABASE … WITH RECOVERY` and `ALTER DATABASE
+  … SET MULTI_USER`.
+
 ## Development
 
 ```bash
@@ -258,6 +316,7 @@ make backend      # gofmt + go vet + go test + go build
 (cd workers/postgres-logical && go test ./...)   # PostgreSQL worker agent
 (cd workers/mysql-replication && go test ./...)  # MySQL and MariaDB worker agent
 (cd workers/redis-shake && go test ./...)        # Redis / Valkey worker agent
+(cd workers/mssql-log-shipping && go test ./...) # SQL Server worker agent
 make helm-lint
 make dev-up       # k3d + Tilt (OpenEverest core + this plugin)
 ```

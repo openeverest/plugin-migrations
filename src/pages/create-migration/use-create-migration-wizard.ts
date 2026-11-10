@@ -13,6 +13,7 @@ import {
   selectEngine,
   validateStep,
   withSourceInstance,
+  withTargetInstance,
 } from './create-migration.utils';
 
 export function useCreateMigrationWizard(
@@ -36,6 +37,8 @@ export function useCreateMigrationWizard(
   const chooseEngine = (engine: Engine) => setDraft((current) => selectEngine(current, engine));
 
   const chooseSourceInstance = (key: string) => setDraft((current) => withSourceInstance(current, key));
+
+  const chooseTargetInstance = (key: string) => setDraft((current) => withTargetInstance(current, key));
 
   const next = () => {
     if (canProceed && !isLastStep) setActiveIndex(activeIndex + 1);
@@ -72,6 +75,7 @@ export function useCreateMigrationWizard(
     updateDraft,
     chooseEngine,
     chooseSourceInstance,
+    chooseTargetInstance,
     next,
     back,
     submit,

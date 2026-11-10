@@ -25,6 +25,9 @@ export const EndpointsCard = ({ migration }: EndpointsCardProps) => (
         items={[
           { label: Messages.endpoints.source, value: describeEndpoint(migration.source) },
           { label: Messages.endpoints.target, value: describeEndpoint(migration.target) },
+          ...(migration.backupStorage
+            ? [{ label: Messages.endpoints.backupStorage, value: migration.backupStorage.name }]
+            : []),
         ]}
       />
     </CardContent>

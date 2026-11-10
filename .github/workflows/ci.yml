@@ -136,6 +136,33 @@ jobs:
         run: docker build -t plugin-migrations-redis-shake:ci workers/redis-shake
 
   # ──────────────────────────────────────────────────────────────────────────
+  # mssql-log-shipping worker agent: vet + test + image build
+  # ──────────────────────────────────────────────────────────────────────────
+  mssql-log-shipping-worker:
+    name: mssql-log-shipping worker (gofmt + vet + test + image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # minio-go needs Go 1.26.
+          go-version: "1.26"
+          cache: false
+
+      - name: Vet
+        run: cd workers/mssql-log-shipping && go vet ./...
+
+      - name: Format
+        run: test -z "$(cd workers/mssql-log-shipping && gofmt -l .)"
+
+      - name: Test
+        run: cd workers/mssql-log-shipping && go test -race ./...
+
+      - name: Build image
+        run: docker build -t plugin-migrations-mssql-log-shipping:ci workers/mssql-log-shipping
+
+  # ──────────────────────────────────────────────────────────────────────────
   # Helm: lint
   # ──────────────────────────────────────────────────────────────────────────
   helm-lint:

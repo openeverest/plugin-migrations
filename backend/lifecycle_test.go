@@ -105,7 +105,7 @@ func TestEndToEndMigrationLifecycle(t *testing.T) {
 	clientset := kubetest.NewVersionedClient()
 	everestClient := everest.NewClient(everestHTTP.URL)
 	workloads := localWorkloads{Workloads: kube.NewWorkloads(clientset, namespace, kube.WorkerConfig{}), baseURL: pcsmHTTP.URL}
-	service := migration.NewService(registry, kube.NewStore(clientset, namespace), workloads, everestClient)
+	service := migration.NewService(registry, kube.NewStore(clientset, namespace), workloads, everestClient, kube.NewSecretReader(clientset))
 	mux := http.NewServeMux()
 	api.New(service, everestClient).RegisterRoutes(mux)
 

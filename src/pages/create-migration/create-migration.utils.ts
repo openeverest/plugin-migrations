@@ -32,6 +32,7 @@ export function createInitialDraft(engines: readonly Engine[]): CreateMigrationD
     externalUri: '',
     caCert: '',
     targetInstanceKey: '',
+    backupStorageName: '',
     options: engine?.defaultOptions(),
   };
 }
@@ -44,16 +45,24 @@ export function selectEngine(draft: CreateMigrationDraft, engine: Engine): Creat
     sourceKind: engine.externalSource ? draft.sourceKind : 'instance',
     sourceInstanceKey: '',
     targetInstanceKey: '',
+    backupStorageName: '',
     options: engine.defaultOptions(),
   };
 }
 
 export function withSourceInstance(draft: CreateMigrationDraft, sourceInstanceKey: string): CreateMigrationDraft {
-  return {
-    ...draft,
-    sourceInstanceKey,
-    targetInstanceKey: draft.targetInstanceKey === sourceInstanceKey ? '' : draft.targetInstanceKey,
-  };
+  if (draft.targetInstanceKey !== sourceInstanceKey) return { ...draft, sourceInstanceKey };
+  return { ...draft, sourceInstanceKey, targetInstanceKey: '', backupStorageName: '' };
+}
+
+/** Backup storages live in the target's namespace, so a new target clears the choice. */
+export function withTargetInstance(draft: CreateMigrationDraft, targetInstanceKey: string): CreateMigrationDraft {
+  if (draft.targetInstanceKey === targetInstanceKey) return draft;
+  return { ...draft, targetInstanceKey, backupStorageName: '' };
+}
+
+export function findTargetInstance(draft: CreateMigrationDraft, context: WizardContext): InstanceSummary | undefined {
+  return findInstance(context.targetInstances, draft.targetInstanceKey);
 }
 
 export function validateName(name: string): string | undefined {
@@ -118,10 +127,14 @@ export function validateStep(step: WizardStep, draft: CreateMigrationDraft, cont
         ? {}
         : { sourceInstance: Messages.source.required };
     }
-    case 'target':
-      return findInstance(context.targetInstances, draft.targetInstanceKey)
-        ? {}
-        : { targetInstance: Messages.target.required };
+    case 'target': {
+      if (!findInstance(context.targetInstances, draft.targetInstanceKey)) {
+        return { targetInstance: Messages.target.required };
+      }
+      return engine?.requiresBackupStorage && draft.backupStorageName === ''
+        ? { backupStorage: Messages.target.backupStorageRequired }
+        : {};
+    }
     case 'options':
       return engine && Object.keys(engine.validateOptions(draft.options)).length === 0
         ? {}
@@ -159,6 +172,7 @@ export function buildCreateRequest(
     source,
     target: { type: 'instance', k8sCluster: target.k8sCluster, namespace: target.namespace, name: target.name },
     options: engine.toRequestOptions(draft.options),
+    ...(engine.requiresBackupStorage ? { backupStorage: { name: draft.backupStorageName } } : {}),
   };
 }
 
@@ -183,6 +197,9 @@ export function buildReviewSummary(draft: CreateMigrationDraft, context: WizardC
         ]
       : []),
     { label: Messages.review.target, value: target ? instanceLabel(target) : '' },
+    ...(context.engine?.requiresBackupStorage
+      ? [{ label: Messages.review.backupStorage, value: draft.backupStorageName }]
+      : []),
   ];
 }
 

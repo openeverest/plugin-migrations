@@ -13,6 +13,8 @@ export interface CreateMigrationDraft {
   externalUri: string;
   caCert: string;
   targetInstanceKey: string;
+  /** For engines that require one: a BackupStorage in the target's namespace. */
+  backupStorageName: string;
   /** Engine-specific form state, owned by the selected engine. */
   options: unknown;
 }
@@ -23,4 +25,4 @@ export interface WizardContext {
   targetInstances: InstanceSummary[];
 }
 
-export type DraftErrors = Readonly<Partial<Record<'name' | 'engine' | 'sourceInstance' | 'externalUri' | 'targetInstance' | 'options', string>>>;
+export type DraftErrors = Readonly<Partial<Record<'name' | 'engine' | 'sourceInstance' | 'externalUri' | 'targetInstance' | 'backupStorage' | 'options', string>>>;

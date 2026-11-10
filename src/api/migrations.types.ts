@@ -38,6 +38,11 @@ export interface MigrationProgress {
   readyForCutover: boolean;
 }
 
+export interface BackupStorageRef {
+  namespace: string;
+  name: string;
+}
+
 export interface Migration {
   id: string;
   name: string;
@@ -45,6 +50,8 @@ export interface Migration {
   source: EndpointRef;
   target: EndpointRef;
   options: Record<string, unknown>;
+  /** The storage engines such as SQL Server log shipping stage backups in. */
+  backupStorage?: BackupStorageRef;
   createdAt: string;
   startedAt?: string;
   phase: MigrationPhase;
@@ -76,4 +83,6 @@ export interface CreateMigrationRequest {
   source: SourceEndpointInput;
   target: InstanceEndpointInput;
   options: Record<string, unknown>;
+  /** A BackupStorage in the target's namespace, for engines that require one. */
+  backupStorage?: { name: string };
 }

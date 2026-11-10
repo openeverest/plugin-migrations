@@ -25,3 +25,5 @@ spec:
       resource: instances
     - verb: read-connection
       resource: instances
+    - verb: read
+      resource: backup-storages

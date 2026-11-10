@@ -4,6 +4,8 @@ export interface EngineDescriptor {
   sourceDatabaseTypes: string[];
   targetDatabaseTypes: string[];
   targetProviders: string[];
+  canPause?: boolean;
+  requiresBackupStorage?: boolean;
 }
 
 export interface PluginStatus {

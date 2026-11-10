@@ -1,0 +1,36 @@
+# OpenEverest SQL Server source (provider-mssql, standalone 2022). Log
+# shipping needs SQL Server 2022+. The instance must trust the S3 storage's
+# TLS certificate, so the BackupStorage (see target-mssql.yaml; create the
+# same one in this namespace) is attached to it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mssql-src
+---
+apiVersion: core.openeverest.io/v1alpha1
+kind: Instance
+metadata:
+  name: legacy-sql
+  namespace: mssql-src
+spec:
+  providerRef:
+    name: mssql
+  version: "2022"
+  topology:
+    type: standalone
+  components:
+    engine:
+      replicas: 1
+      resources:
+        limits: {cpu: "2", memory: 3Gi}
+      storage:
+        size: 10Gi
+      parameters:
+        edition: Developer
+  backup:
+    enabled: true
+    classRef:
+      name: mssql-native
+    storages:
+      - storageRef:
+          name: minio

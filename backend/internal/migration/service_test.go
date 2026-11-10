@@ -101,8 +101,35 @@ func (f *fakeWorkloads) TargetHasWorkers(context.Context, everest.InstanceRef) (
 type fakeEverest struct {
 	connections map[string]everest.ConnectionDetails
 	// denied instances fail both access checks and connection reads.
-	denied map[string]error
-	calls  []string
+	denied   map[string]error
+	storages map[string]everest.BackupStorageSpec
+	calls    []string
+}
+
+func (f *fakeEverest) GetBackupStorage(_ context.Context, _ string, ref everest.BackupStorageRef) (everest.BackupStorageSpec, error) {
+	f.calls = append(f.calls, "storage:"+ref.Namespace+"/"+ref.Name)
+	if err := f.denied["storage:"+ref.Namespace+"/"+ref.Name]; err != nil {
+		return everest.BackupStorageSpec{}, err
+	}
+	spec, ok := f.storages[ref.Namespace+"/"+ref.Name]
+	if !ok {
+		return everest.BackupStorageSpec{}, everest.ErrNotFound
+	}
+	return spec, nil
+}
+
+type fakeSecrets struct {
+	secrets map[string]map[string][]byte
+	reads   []string
+}
+
+func (f *fakeSecrets) ReadSecret(_ context.Context, namespace, name string) (map[string][]byte, error) {
+	f.reads = append(f.reads, namespace+"/"+name)
+	data, ok := f.secrets[namespace+"/"+name]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return data, nil
 }
 
 func refKey(ref everest.InstanceRef) string { return ref.Namespace + "/" + ref.Name }
@@ -173,18 +200,23 @@ func (c *teardownController) Teardown(context.Context) error {
 type fakeEngine struct {
 	controller *fakeController
 	prepareErr error
+	// needsStorage makes the engine require a backup storage.
+	needsStorage bool
+	prepared     engine.PrepareInput
 	// teardown, when set, makes the controller an engine.Teardowner.
 	teardown *teardownController
 }
 
 func (e *fakeEngine) ID() string { return "fake" }
 func (e *fakeEngine) Describe() engine.Descriptor {
-	return engine.Descriptor{ID: "fake", SourceDatabaseTypes: []string{"mongodb"}, TargetDatabaseTypes: []string{"mongodb"}, TargetProviders: []string{"psmdb"}, CanPause: true}
+	return engine.Descriptor{ID: "fake", SourceDatabaseTypes: []string{"mongodb"}, TargetDatabaseTypes: []string{"mongodb"}, TargetProviders: []string{"psmdb"}, CanPause: true,
+		RequiresBackupStorage: e.needsStorage}
 }
 func (e *fakeEngine) Supports(source, target engine.EndpointInfo) bool {
 	return source.DatabaseType == "mongodb" && target.DatabaseType == "mongodb"
 }
 func (e *fakeEngine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
+	e.prepared = input
 	if e.prepareErr != nil {
 		return engine.Prepared{}, e.prepareErr
 	}
@@ -208,6 +240,7 @@ type harness struct {
 	everest    *fakeEverest
 	controller *fakeController
 	engine     *fakeEngine
+	secrets    *fakeSecrets
 }
 
 func newHarness(t *testing.T) *harness {
@@ -224,10 +257,11 @@ func newHarness(t *testing.T) *harness {
 		everest:    &fakeEverest{connections: map[string]everest.ConnectionDetails{}, denied: map[string]error{}},
 		controller: controller,
 		engine:     fake,
+		secrets:    &fakeSecrets{secrets: map[string]map[string][]byte{}},
 	}
 	h.everest.connections["shop/orders"] = everest.ConnectionDetails{Type: "mongodb", Provider: "psmdb", URI: "mongodb://admin:pw@orders/admin"}
 	h.everest.connections["shop/legacy"] = everest.ConnectionDetails{Type: "mongodb", Provider: "psmdb", URI: "mongodb://admin:pw@legacy/admin"}
-	h.service = NewService(registry, h.store, h.workloads, h.everest)
+	h.service = NewService(registry, h.store, h.workloads, h.everest, h.secrets)
 	ids := 0
 	h.service.newID = func() string { ids++; return fmt.Sprintf("mig-%d", ids) }
 	clock := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
@@ -288,6 +322,76 @@ func TestCreateValidation(t *testing.T) {
 			mutate(&request)
 			_, err := h.service.Create(context.Background(), "jwt", request)
 			if KindOf(err) != KindInvalid {
+				t.Fatalf("error = %v (kind %q)", err, KindOf(err))
+			}
+		})
+	}
+}
+
+func withStorage(h *harness) {
+	h.engine.needsStorage = true
+	pathStyle := true
+	spec := everest.BackupStorageSpec{Type: "s3", S3: &everest.BackupStorageS3{
+		Bucket: "migrations", Region: "us-east-1", EndpointURL: "https://minio.minio.svc", ForcePathStyle: &pathStyle,
+		CredentialsSecretRef: everest.SecretRef{Name: "minio-credentials"},
+	}}
+	h.everest.storages = map[string]everest.BackupStorageSpec{"shop/minio": spec}
+	h.secrets.secrets["shop/minio-credentials"] = map[string][]byte{
+		"AWS_ACCESS_KEY_ID": []byte("key"), "AWS_SECRET_ACCESS_KEY": []byte("s3cret"), "ca.crt": []byte("PEM"),
+	}
+}
+
+func TestCreateResolvesBackupStorage(t *testing.T) {
+	h := newHarness(t)
+	withStorage(h)
+	request := externalRequest()
+	request.BackupStorage = &BackupStorageRequest{Name: "minio"}
+	view, err := h.service.Create(context.Background(), "jwt", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := h.engine.prepared.BackupStorage
+	if storage == nil || storage.Bucket != "migrations" || !storage.ForcePathStyle || !storage.VerifyTLS ||
+		storage.AccessKeyID != "key" || storage.SecretAccessKey != "s3cret" || storage.CACert != "PEM" || storage.Namespace != "shop" {
+		t.Fatalf("unexpected storage: %+v", storage)
+	}
+	if view.BackupStorage == nil || *view.BackupStorage != (BackupStorageRef{Namespace: "shop", Name: "minio"}) {
+		t.Fatalf("view storage = %+v", view.BackupStorage)
+	}
+	if !slices.Contains(h.everest.calls, "storage:shop/minio") || !slices.Equal(h.secrets.reads, []string{"shop/minio-credentials"}) {
+		t.Fatalf("calls = %v, reads = %v", h.everest.calls, h.secrets.reads)
+	}
+	record, _ := h.store.Get(context.Background(), view.ID)
+	if encoded, _ := json.Marshal(record); strings.Contains(string(encoded), "s3cret") {
+		t.Fatalf("record persisted storage credentials: %s", encoded)
+	}
+}
+
+func TestCreateBackupStorageErrors(t *testing.T) {
+	tests := map[string]struct {
+		mutate func(*harness, *CreateRequest)
+		check  func(error) bool
+	}{
+		"missing": {func(_ *harness, r *CreateRequest) { r.BackupStorage = nil }, func(err error) bool { return KindOf(err) == KindInvalid }},
+		"not found": {func(_ *harness, r *CreateRequest) { r.BackupStorage.Name = "other" },
+			func(err error) bool { return KindOf(err) == KindInvalid }},
+		"forbidden": {func(h *harness, _ *CreateRequest) { h.everest.denied["storage:shop/minio"] = everest.ErrForbidden },
+			func(err error) bool { return errors.Is(err, everest.ErrForbidden) }},
+		"secret unreadable": {func(h *harness, _ *CreateRequest) { delete(h.secrets.secrets, "shop/minio-credentials") },
+			func(err error) bool { return KindOf(err) == KindUnavailable }},
+		"no keys": {func(h *harness, _ *CreateRequest) { h.secrets.secrets["shop/minio-credentials"] = map[string][]byte{} },
+			func(err error) bool { return KindOf(err) == KindInvalid }},
+		"not required": {func(h *harness, _ *CreateRequest) { h.engine.needsStorage = false },
+			func(err error) bool { return KindOf(err) == KindInvalid }},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			withStorage(h)
+			request := externalRequest()
+			request.BackupStorage = &BackupStorageRequest{Name: "minio"}
+			test.mutate(h, &request)
+			if _, err := h.service.Create(context.Background(), "jwt", request); !test.check(err) {
 				t.Fatalf("error = %v (kind %q)", err, KindOf(err))
 			}
 		})

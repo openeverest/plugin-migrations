@@ -32,6 +32,8 @@ interface EngineMetadata {
   targetProviders: readonly string[];
   /** Omit when the engine cannot read from a database outside OpenEverest. */
   externalSource?: ExternalSourceDefinition;
+  /** The engine stages data in a BackupStorage of the target's namespace. */
+  requiresBackupStorage?: boolean;
   /** Describes an options snapshot (from a draft or the API) for review and details. */
   summarizeOptions: (options: unknown) => OptionSummaryItem[];
 }

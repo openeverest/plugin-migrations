@@ -39,6 +39,7 @@ export const Messages = {
     title: 'Endpoints',
     source: 'Source',
     target: 'Target',
+    backupStorage: 'Backup storage',
     describe: (type: string, label: string) => `${label} (${type})`,
     provider: (label: string, provider: string) => `${label} · ${provider}`,
   },

@@ -1,6 +1,7 @@
 import type { Engine, OptionSummaryItem } from './engine.types';
 import { summarizeUnknownOptions } from './engines.utils';
 import { mariadbReplicationEngine } from './mariadb-replication';
+import { mssqlLogShippingEngine } from './mssql-log-shipping';
 import { mysqlReplicationEngine } from './mysql-replication';
 import { pcsmEngine } from './pcsm';
 import { postgresLogicalEngine } from './postgres-logical';
@@ -12,6 +13,7 @@ export const ENGINES: readonly Engine[] = [
   mysqlReplicationEngine,
   mariadbReplicationEngine,
   redisShakeEngine,
+  mssqlLogShippingEngine,
 ];
 
 export function getEngine(id: string): Engine | undefined {

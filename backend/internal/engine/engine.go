@@ -91,17 +91,20 @@ type PrepareInput struct {
 
 // BackupStorage is a resolved OpenEverest S3 BackupStorage. Never log it.
 type BackupStorage struct {
-	Namespace       string
-	Name            string
-	EndpointURL     string
-	Bucket          string
+	Namespace   string
+	Name        string
+	EndpointURL string
+	Bucket      string
+	// Prefix is the storage's path within the bucket, without slashes at
+	// either end; empty for the bucket's root.
+	Prefix          string
 	Region          string
 	ForcePathStyle  bool
 	VerifyTLS       bool
 	AccessKeyID     string
 	SecretAccessKey string
-	// CACert is the optional ca.crt of the credentials Secret, which
-	// providers mount into database pods to trust a private CA.
+	// CACert is the optional PEM bundle named by the storage's tls.ca,
+	// which providers mount into database pods to trust a private CA.
 	CACert string
 }
 

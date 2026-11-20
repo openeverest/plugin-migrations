@@ -139,6 +139,9 @@ The lifecycle, storage, API, and pages are shared and need no changes.
 
 ## Install
 
+The plugin needs **OpenEverest 2.0.0-alpha.1 or later** (it reads the
+`backup.openeverest.io/v1alpha1` BackupStorage shape introduced there).
+
 ```bash
 helm install plugin-migrations oci://ghcr.io/openeverest/charts/plugin-migrations \
   --version 0.1.0 -n everest-system
@@ -175,6 +178,7 @@ Then open **Migrations** in the OpenEverest sidebar.
 
 ## Requirements and limitations (v0.1)
 
+- OpenEverest 2.0.0-alpha.1 or later.
 - External sources must be reachable from worker pods in the workload
   namespace.
 - Each target instance can have only one migration at a time, even a
@@ -291,13 +295,16 @@ SQL Server (`mssql-log-shipping`):
 - Target: an OpenEverest `mssql` instance (provider-mssql publishes `sa`),
   the same or a newer version. The databases must not exist on the target, or
   enable *Recreate the target databases*.
-- **Backup storage**: an S3 BackupStorage in the target's namespace. SQL
-  Server reaches S3 over HTTPS only and always verifies the certificate: with
-  a private CA, put it in the storage's credentials Secret as `ca.crt` and
-  attach the storage to the OpenEverest instances (provider-mssql then
-  mounts the CA); an external source must trust it itself. The plugin reads
-  the storage's credentials with its ServiceAccount once you proved you can
-  read the storage.
+- **Backup storage**: a BackupStorage of class `s3` with `AccessKey`
+  authentication in the target's namespace. Backups are staged under
+  `[<prefix>/]openeverest-migrations/<migration>/` in its bucket, honouring
+  the storage's `location.objectStore.prefix`. SQL Server reaches S3 over
+  HTTPS only and always verifies the certificate, so storages with
+  `tls.insecureSkipVerify` are refused: with a private CA, set the storage's
+  `tls.ca.secretKeyRef` and attach the storage to the OpenEverest instances
+  (provider-mssql then mounts the CA); an external source must trust it
+  itself. The plugin reads the storage's credentials and CA Secrets with its
+  ServiceAccount once you proved you can read the storage.
 - **The migration owns the databases' log chain.** Any other log backup (an
   OpenEverest source's point-in-time recovery, a maintenance plan) takes log
   records the target never gets: the preflight refuses sources with such

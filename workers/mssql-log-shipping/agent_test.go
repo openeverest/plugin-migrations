@@ -50,7 +50,7 @@ func TestParseEndpointAndDSN(t *testing.T) {
 }
 
 func TestStorageURLs(t *testing.T) {
-	storage, err := newStorage("https://minio.minio.svc.cluster.local", "migrations", "us-east-1", true, "key", "secret", "", "mig-ab12")
+	storage, err := newStorage("https://minio.minio.svc.cluster.local", "migrations", "", "us-east-1", true, "key", "secret", "", "mig-ab12")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestStorageURLs(t *testing.T) {
 	if fullBackupKey("shop", 1, 1) != "shop/full.bak" || fullBackupKey("shop", 2, 3) != "shop/full-02of03.bak" {
 		t.Fatal("unexpected full backup keys")
 	}
-	virtual, err := newStorage("https://s3.eu-west-1.amazonaws.com:443", "bucket", "eu-west-1", false, "key", "secret", "", "mig-ab12")
+	virtual, err := newStorage("https://s3.eu-west-1.amazonaws.com:443", "bucket", "", "eu-west-1", false, "key", "secret", "", "mig-ab12")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +71,25 @@ func TestStorageURLs(t *testing.T) {
 		t.Fatalf("credential = %s", virtual.CredentialName())
 	}
 	for _, endpoint := range []string{"http://minio:9000", "https://minio/path", "minio:9000"} {
-		if _, err := newStorage(endpoint, "b", "", true, "k", "s", "", "m"); err == nil {
+		if _, err := newStorage(endpoint, "b", "", "", true, "k", "s", "", "m"); err == nil {
 			t.Errorf("%s: expected an error", endpoint)
 		}
 	}
-	if _, err := newStorage("https://minio", "b", "", true, "k:x", "s", "", "m"); err == nil {
+	if _, err := newStorage("https://minio", "b", "", "", true, "k:x", "s", "", "m"); err == nil {
 		t.Error("a colon in the access key ID must be rejected")
+	}
+	prefixed, err := newStorage("https://minio", "b", "/team-a/prod/", "", true, "k", "s", "", "mig-ab12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixed.Prefix != "team-a/prod/openeverest-migrations/mig-ab12" ||
+		prefixed.URL("probe/probe.txt") != "s3://minio/b/team-a/prod/openeverest-migrations/mig-ab12/probe/probe.txt" {
+		t.Fatalf("prefix = %s, url = %s", prefixed.Prefix, prefixed.URL("probe/probe.txt"))
+	}
+	for _, prefix := range []string{"a//b", "a/../b", "./a"} {
+		if _, err := newStorage("https://minio", "b", prefix, "", true, "k", "s", "", "m"); err == nil {
+			t.Errorf("prefix %q: expected an error", prefix)
+		}
 	}
 }
 

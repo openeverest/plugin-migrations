@@ -114,6 +114,9 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 	if err != nil {
 		return engine.Prepared{}, invalidRequest("backup storage %s %v", storage.Name, err)
 	}
+	if !storage.VerifyTLS {
+		return engine.Prepared{}, invalidRequest("backup storage %s sets tls.insecureSkipVerify, but SQL Server always verifies the S3 certificate: give the storage its CA in tls.ca instead", storage.Name)
+	}
 	if strings.Contains(storage.AccessKeyID, ":") {
 		return engine.Prepared{}, invalidRequest("backup storage %s: SQL Server cannot use an access key ID that contains ':'", storage.Name)
 	}
@@ -144,6 +147,9 @@ func (e *Engine) Prepare(input engine.PrepareInput) (engine.Prepared, error) {
 			"S3_ACCESS_KEY_ID": secretKeyS3Key, "S3_SECRET_ACCESS_KEY": secretKeyS3Secret,
 		},
 		SecretFiles: map[string]string{},
+	}
+	if storage.Prefix != "" {
+		worker.Env["S3_PREFIX"] = storage.Prefix
 	}
 	if path := mount(storage.CACert, secretKeyS3CA, &worker); path != "" {
 		worker.Env["S3_CA_FILE"] = path

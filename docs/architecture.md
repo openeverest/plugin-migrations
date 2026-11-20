@@ -126,8 +126,8 @@ type Teardowner interface {
 CA) and trusted runner configuration (image and pull policy from Helm). An
 engine whose descriptor sets `RequiresBackupStorage` also receives the
 BackupStorage the user picked in the target's namespace, with its S3
-endpoint, bucket, region, addressing style, credentials and optional CA
-(`engine.BackupStorage`). It returns:
+endpoint, bucket, prefix, region, addressing style, TLS verification,
+credentials and optional CA (`engine.BackupStorage`). It returns:
 
 - `WorkerSpec`: container port, health path, env, secret data, secret env,
   secret files (TLS CAs) and an optional `Volume` (size in GiB, mount path and
@@ -286,11 +286,18 @@ it later (for GitOps) without changing the domain service.
    3. For engines that require one, resolve the **backup storage** named in
       the request, in the target's namespace:
       `GET /v1/clusters/{c}/namespaces/{ns}/backup-storages/{name}` with the
-      caller's JWT proves the caller can read it and returns its S3 settings;
-      the backend then reads the credentials Secret that storage names
-      (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `ca.crt`) with
-      its ServiceAccount, because the API never returns credentials. The
-      Secret's name comes from the storage, never from the request.
+      caller's JWT proves the caller can read it and returns its spec
+      (`backup.openeverest.io/v1alpha1`, OpenEverest 2.0.0-alpha.1+). Only
+      storages of class `s3` (`spec.backupStorageClassRef.name`) with
+      `AccessKey` authentication and a bucket are usable; the endpoint,
+      region and addressing style come from `spec.parameters`, the bucket and
+      optional prefix from `spec.location.objectStore`, and
+      `spec.tls.insecureSkipVerify` turns off TLS verification. The backend
+      then reads the Secret in `spec.authentication.credentialsSecretRef`
+      (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) and, when set, the CA
+      bundle key in `spec.tls.ca.secretKeyRef`, with its ServiceAccount,
+      because the API never returns credentials. Secret names come from the
+      storage, never from the request.
    4. Reject a target that already has a migration record, whatever its phase,
       or a worker pod still shutting down (see §11, "One migration per
       target"). Users delete the previous migration first.
@@ -380,7 +387,9 @@ pickers. The response matches plugin-bench:
 ### `GET /api/backup-storages?k8sCluster=main&namespace=shop`
 
 The backup storages the caller can read in a namespace, for engines that
-require one (the target's namespace). No credentials:
+require one (the target's namespace). No credentials. `type` is the
+storage's BackupStorageClass (`spec.backupStorageClassRef.name`); the UI
+offers `s3` storages only:
 
 ```json
 { "backupStorages": [ { "name": "s3-eu", "type": "s3", "bucket": "backups", "endpointURL": "https://s3.eu-west-1.amazonaws.com" } ] }
@@ -604,9 +613,10 @@ URLs) and the target must not be older than the source. The worker:
   target, the target databases absent (or `recreateDatabases`), no foreign
   log backups in the last 24 hours, and both servers reading a probe object
   from the storage with the migration's credential (they must trust its TLS
-  certificate). The credential is named after the migration's prefix
-  (`s3://…/<bucket>/openeverest-migrations/<id>`), the longest prefix, so the
-  operator's bucket-wide credential is never used.
+  certificate; storages with `tls.insecureSkipVerify` are refused). The
+  credential is named after the migration's prefix
+  (`s3://…/<bucket>/[<storage prefix>/]openeverest-migrations/<id>`), the
+  longest prefix, so the operator's bucket-wide credential is never used.
 - **Copy**: a `COPY_ONLY` full backup (a regular one when the database never
   had a full backup, which starts its log chain) restored `WITH NORECOVERY`,
   files moved to the target's default paths.
@@ -837,7 +847,8 @@ them through dm-master's HTTP gateway (`dmctl` only for the precheck):
     credentials with a cluster-wide `get secrets` permission, because the
     OpenEverest API returns none. An API endpoint for plugins (or a scoped
     token) would remove it. SQL Server always verifies the storage's TLS
-    certificate, so a private CA must be mounted on both servers.
+    certificate, so a private CA (the storage's `tls.ca`) must be mounted on
+    both servers, and `tls.insecureSkipVerify` is refused.
 19. **TiDB: the dump needs disk.** DM has no streaming copy: dumpling writes
     the snapshot to the worker's volume, then the load reads it. The volume is
     sized by the user and checked against the source's table sizes. Large

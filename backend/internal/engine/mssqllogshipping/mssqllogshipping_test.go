@@ -62,6 +62,9 @@ func TestPrepareInstances(t *testing.T) {
 		worker.Env["S3_CA_FILE"] != engine.SecretMountPath+"/s3-ca.crt" {
 		t.Fatalf("env = %v", worker.Env)
 	}
+	if _, set := worker.Env["S3_PREFIX"]; set {
+		t.Fatalf("a storage without a prefix must not set S3_PREFIX: %v", worker.Env)
+	}
 	if string(worker.SecretData[secretKeyS3Key]) != "key" || string(worker.SecretData[secretKeyS3Secret]) != "s3cret" ||
 		worker.SecretEnv["S3_SECRET_ACCESS_KEY"] != secretKeyS3Secret || worker.SecretFiles[secretKeyS3CA] != "s3-ca.crt" {
 		t.Fatalf("secrets = %v %v", worker.SecretEnv, worker.SecretFiles)
@@ -129,6 +132,7 @@ func TestPrepareRejects(t *testing.T) {
 		"http storage":    func(i *engine.PrepareInput) { i.BackupStorage.EndpointURL = "http://minio:9000" },
 		"storage path":    func(i *engine.PrepareInput) { i.BackupStorage.EndpointURL = "https://minio/bucket" },
 		"colon in key ID": func(i *engine.PrepareInput) { i.BackupStorage.AccessKeyID = "a:b" },
+		"insecure TLS":    func(i *engine.PrepareInput) { i.BackupStorage.VerifyTLS = false },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -142,6 +146,18 @@ func TestPrepareRejects(t *testing.T) {
 				t.Fatalf("error leaks a credential: %v", err)
 			}
 		})
+	}
+}
+
+func TestPrepareStoragePrefix(t *testing.T) {
+	input := prepareInput(`{"databases":["shop"]}`)
+	input.BackupStorage.Prefix = "team-a/prod"
+	prepared, err := New().Prepare(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Worker.Env["S3_PREFIX"] != "team-a/prod" || prepared.Worker.Env["S3_BUCKET"] != "migrations" {
+		t.Fatalf("env = %v", prepared.Worker.Env)
 	}
 }
 

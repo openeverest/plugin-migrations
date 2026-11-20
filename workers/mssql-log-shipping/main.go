@@ -72,7 +72,7 @@ func configFromEnv() (Config, error) {
 	if !regionPattern.MatchString(region) {
 		return Config{}, errors.New("S3_REGION must be lowercase letters, digits or '-'")
 	}
-	config.Storage, err = newStorage(os.Getenv("S3_ENDPOINT"), os.Getenv("S3_BUCKET"), region, os.Getenv("S3_FORCE_PATH_STYLE") == "true",
+	config.Storage, err = newStorage(os.Getenv("S3_ENDPOINT"), os.Getenv("S3_BUCKET"), os.Getenv("S3_PREFIX"), region, os.Getenv("S3_FORCE_PATH_STYLE") == "true",
 		os.Getenv("S3_ACCESS_KEY_ID"), os.Getenv("S3_SECRET_ACCESS_KEY"), os.Getenv("S3_CA_FILE"), config.Name)
 	if err != nil {
 		return Config{}, err

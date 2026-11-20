@@ -17,12 +17,13 @@ runs as 65532:65532 and listens on `:2243`.
 | `MIGRATION_NAME` | The migration ID; names the S3 prefix, the credential and the state rows. |
 | `SOURCE_URI`, `TARGET_URI` | `sqlserver://user:password@host:port?encrypt=…&TrustServerCertificate=…&certificate=…` (Secret). |
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_FORCE_PATH_STYLE` | From the BackupStorage. The endpoint must be `https://`. |
+| `S3_PREFIX` | The BackupStorage's optional `location.objectStore.prefix`. |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | From the BackupStorage's credentials Secret (Secret). |
-| `S3_CA_FILE` | The credentials Secret's optional `ca.crt`, for the agent's own S3 calls. |
+| `S3_CA_FILE` | The BackupStorage's optional `tls.ca` bundle, for the agent's own S3 calls. |
 
-Backups go under `openeverest-migrations/<migration>/` in the bucket. The
-servers authenticate with a credential named after that prefix
-(`s3://<endpoint>/<bucket>/openeverest-migrations/<migration>`): SQL Server
+Backups go under `[<S3_PREFIX>/]openeverest-migrations/<migration>/` in the
+bucket. The servers authenticate with a credential named after that prefix
+(`s3://<endpoint>/<bucket>/[<S3_PREFIX>/]openeverest-migrations/<migration>`): SQL Server
 picks the credential with the longest matching prefix, so it never collides
 with the operator's bucket-wide backup credential.
 
@@ -41,8 +42,8 @@ with the operator's bucket-wide backup credential.
    in an availability group cannot be left restoring. The agent then writes a
    probe object and makes both servers read it with the migration's
    credential: they must trust the storage's TLS certificate (provider-mssql
-   mounts the BackupStorage `ca.crt` into instances the storage is attached
-   to).
+   mounts the BackupStorage's `tls.ca` bundle into instances the storage is
+   attached to).
 2. **State**. `master.dbo.openeverest_migration` and
    `master.dbo.openeverest_migration_database` on the target hold the phase
    (`preparing`, `copying`, `shipping`, `cutover`, `completed`), the failure

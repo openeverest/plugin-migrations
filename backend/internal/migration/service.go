@@ -237,30 +237,61 @@ func (s *Service) resolveBackupStorage(ctx context.Context, token, k8sCluster st
 	if err != nil {
 		return nil, err
 	}
-	if spec.Type != "s3" || spec.S3 == nil || spec.S3.CredentialsSecretRef.Name == "" {
-		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s must be an S3 storage with credentials", ref.Name))
+	location := spec.ObjectStore()
+	switch {
+	case spec.Class() != "s3":
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s must use the s3 BackupStorageClass, not %q", ref.Name, spec.Class()))
+	case spec.Authentication.Mode != "AccessKey" || spec.Authentication.CredentialsSecretRef == nil ||
+		spec.Authentication.CredentialsSecretRef.Name == "":
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s must use AccessKey authentication with a credentials Secret", ref.Name))
+	case location == nil || location.Bucket == "":
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s has no bucket", ref.Name))
+	}
+	parameters, err := spec.S3Parameters()
+	if err != nil {
+		return nil, newError(KindInvalid, fmt.Sprintf("backup storage %s has %v", ref.Name, err))
 	}
 	if s.secrets == nil {
 		return nil, newError(KindUnavailable, "the plugin cannot read backup storage credentials")
 	}
-	data, err := s.secrets.ReadSecret(ctx, ref.Namespace, spec.S3.CredentialsSecretRef.Name)
+	data, err := s.secrets.ReadSecret(ctx, ref.Namespace, spec.Authentication.CredentialsSecretRef.Name)
 	if err != nil {
 		log.Printf("read the credentials of backup storage %s/%s: %v", ref.Namespace, ref.Name, err)
 		return nil, newError(KindUnavailable, fmt.Sprintf("could not read the credentials of backup storage %s", ref.Name))
 	}
 	storage := &engine.BackupStorage{
 		Namespace: ref.Namespace, Name: ref.Name,
-		EndpointURL: spec.S3.EndpointURL, Bucket: spec.S3.Bucket, Region: spec.S3.Region,
-		ForcePathStyle:  spec.S3.ForcePathStyle != nil && *spec.S3.ForcePathStyle,
-		VerifyTLS:       spec.S3.VerifyTLS == nil || *spec.S3.VerifyTLS,
+		EndpointURL: parameters.EndpointURL, Bucket: location.Bucket, Prefix: strings.Trim(location.Prefix, "/"), Region: parameters.Region,
+		ForcePathStyle:  parameters.ForcePathStyle != nil && *parameters.ForcePathStyle,
+		VerifyTLS:       spec.TLS == nil || !spec.TLS.InsecureSkipVerify,
 		AccessKeyID:     string(data["AWS_ACCESS_KEY_ID"]),
 		SecretAccessKey: string(data["AWS_SECRET_ACCESS_KEY"]),
-		CACert:          string(data["ca.crt"]),
+	}
+	if spec.TLS != nil && spec.TLS.CA != nil {
+		if storage.CACert, err = s.readStorageCA(ctx, ref, spec.TLS.CA.SecretKeyRef); err != nil {
+			return nil, err
+		}
 	}
 	if storage.AccessKeyID == "" || storage.SecretAccessKey == "" {
 		return nil, newError(KindInvalid, fmt.Sprintf("the credentials Secret of backup storage %s lacks AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY", ref.Name))
 	}
 	return storage, nil
+}
+
+// readStorageCA reads the PEM bundle a BackupStorage's tls.ca names.
+func (s *Service) readStorageCA(ctx context.Context, ref BackupStorageRef, secretKey *everest.SecretKeyRef) (string, error) {
+	if secretKey == nil || secretKey.Name == "" || secretKey.Key == "" {
+		return "", newError(KindInvalid, fmt.Sprintf("backup storage %s has a tls.ca without a secretKeyRef", ref.Name))
+	}
+	data, err := s.secrets.ReadSecret(ctx, ref.Namespace, secretKey.Name)
+	if err != nil {
+		log.Printf("read the CA bundle of backup storage %s/%s: %v", ref.Namespace, ref.Name, err)
+		return "", newError(KindUnavailable, fmt.Sprintf("could not read the CA bundle of backup storage %s", ref.Name))
+	}
+	if strings.TrimSpace(string(data[secretKey.Key])) == "" {
+		return "", newError(KindInvalid, fmt.Sprintf("the CA Secret of backup storage %s lacks the key %s", ref.Name, secretKey.Key))
+	}
+	return string(data[secretKey.Key]), nil
 }
 
 // ensureTargetIsFree allows one migration per target, completed or not. PCSM

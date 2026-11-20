@@ -102,7 +102,7 @@ engines:
   # through an OpenEverest BackupStorage: the servers back up to and restore
   # from S3 themselves; see workers/mssql-log-shipping. Released together with
   # the plugin. Enabling it grants the backend read access to Secrets in
-  # every namespace, to read the chosen BackupStorage's credentials.
+  # every namespace, to read the chosen BackupStorage's credentials and CA.
   mssql-log-shipping:
     enabled: true
     image:

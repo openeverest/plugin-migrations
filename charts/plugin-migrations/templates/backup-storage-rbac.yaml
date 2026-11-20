@@ -1,7 +1,8 @@
 {{- /*
 Engines that stage data in an OpenEverest BackupStorage need its credentials,
 which the OpenEverest API does not return. The backend reads the storage with
-the caller's JWT (proving access) and then only the Secret that storage names.
+the caller's JWT (proving access) and then only the Secrets that storage names
+(credentials and, with tls.ca, the CA bundle).
 */}}
 {{- $mssql := index .Values.engines "mssql-log-shipping" | default dict }}
 {{- if $mssql.enabled }}

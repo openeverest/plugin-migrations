@@ -331,14 +331,25 @@ func TestCreateValidation(t *testing.T) {
 func withStorage(h *harness) {
 	h.engine.needsStorage = true
 	pathStyle := true
-	spec := everest.BackupStorageSpec{Type: "s3", S3: &everest.BackupStorageS3{
-		Bucket: "migrations", Region: "us-east-1", EndpointURL: "https://minio.minio.svc", ForcePathStyle: &pathStyle,
-		CredentialsSecretRef: everest.SecretRef{Name: "minio-credentials"},
-	}}
+	parameters, _ := json.Marshal(everest.S3Parameters{Region: "us-east-1", EndpointURL: "https://minio.minio.svc", ForcePathStyle: &pathStyle})
+	spec := everest.BackupStorageSpec{
+		BackupStorageClassRef: everest.ObjectRef{Name: "s3"},
+		Location:              everest.BackupStorageLocation{ObjectStore: &everest.ObjectStoreLocation{Bucket: "migrations", Prefix: "team-a/prod"}},
+		Parameters:            parameters,
+		Authentication:        everest.Authentication{Mode: "AccessKey", CredentialsSecretRef: &everest.SecretRef{Name: "minio-credentials"}},
+		TLS:                   &everest.TLSConfig{CA: &everest.CABundleSource{SecretKeyRef: &everest.SecretKeyRef{Name: "minio-ca", Key: "ca.crt"}}},
+	}
 	h.everest.storages = map[string]everest.BackupStorageSpec{"shop/minio": spec}
 	h.secrets.secrets["shop/minio-credentials"] = map[string][]byte{
-		"AWS_ACCESS_KEY_ID": []byte("key"), "AWS_SECRET_ACCESS_KEY": []byte("s3cret"), "ca.crt": []byte("PEM"),
+		"AWS_ACCESS_KEY_ID": []byte("key"), "AWS_SECRET_ACCESS_KEY": []byte("s3cret"),
 	}
+	h.secrets.secrets["shop/minio-ca"] = map[string][]byte{"ca.crt": []byte("PEM")}
+}
+
+func mutateStorage(h *harness, mutate func(*everest.BackupStorageSpec)) {
+	spec := h.everest.storages["shop/minio"]
+	mutate(&spec)
+	h.everest.storages["shop/minio"] = spec
 }
 
 func TestCreateResolvesBackupStorage(t *testing.T) {
@@ -351,19 +362,34 @@ func TestCreateResolvesBackupStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage := h.engine.prepared.BackupStorage
-	if storage == nil || storage.Bucket != "migrations" || !storage.ForcePathStyle || !storage.VerifyTLS ||
+	if storage == nil || storage.Bucket != "migrations" || storage.Prefix != "team-a/prod" || storage.Region != "us-east-1" ||
+		storage.EndpointURL != "https://minio.minio.svc" || !storage.ForcePathStyle || !storage.VerifyTLS ||
 		storage.AccessKeyID != "key" || storage.SecretAccessKey != "s3cret" || storage.CACert != "PEM" || storage.Namespace != "shop" {
 		t.Fatalf("unexpected storage: %+v", storage)
 	}
 	if view.BackupStorage == nil || *view.BackupStorage != (BackupStorageRef{Namespace: "shop", Name: "minio"}) {
 		t.Fatalf("view storage = %+v", view.BackupStorage)
 	}
-	if !slices.Contains(h.everest.calls, "storage:shop/minio") || !slices.Equal(h.secrets.reads, []string{"shop/minio-credentials"}) {
+	if !slices.Contains(h.everest.calls, "storage:shop/minio") || !slices.Equal(h.secrets.reads, []string{"shop/minio-credentials", "shop/minio-ca"}) {
 		t.Fatalf("calls = %v, reads = %v", h.everest.calls, h.secrets.reads)
 	}
 	record, _ := h.store.Get(context.Background(), view.ID)
 	if encoded, _ := json.Marshal(record); strings.Contains(string(encoded), "s3cret") {
 		t.Fatalf("record persisted storage credentials: %s", encoded)
+	}
+}
+
+func TestCreateMapsInsecureSkipVerify(t *testing.T) {
+	h := newHarness(t)
+	withStorage(h)
+	mutateStorage(h, func(spec *everest.BackupStorageSpec) { spec.TLS = &everest.TLSConfig{InsecureSkipVerify: true} })
+	request := externalRequest()
+	request.BackupStorage = &BackupStorageRequest{Name: "minio"}
+	if _, err := h.service.Create(context.Background(), "jwt", request); err != nil {
+		t.Fatal(err)
+	}
+	if storage := h.engine.prepared.BackupStorage; storage.VerifyTLS || storage.CACert != "" {
+		t.Fatalf("unexpected storage: %+v", storage)
 	}
 }
 
@@ -382,6 +408,21 @@ func TestCreateBackupStorageErrors(t *testing.T) {
 		"no keys": {func(h *harness, _ *CreateRequest) { h.secrets.secrets["shop/minio-credentials"] = map[string][]byte{} },
 			func(err error) bool { return KindOf(err) == KindInvalid }},
 		"not required": {func(h *harness, _ *CreateRequest) { h.engine.needsStorage = false },
+			func(err error) bool { return KindOf(err) == KindInvalid }},
+		"not s3": {func(h *harness, _ *CreateRequest) {
+			mutateStorage(h, func(spec *everest.BackupStorageSpec) { spec.BackupStorageClassRef.Name = "azure-blob" })
+		}, func(err error) bool {
+			return KindOf(err) == KindInvalid && strings.Contains(err.Error(), "s3 BackupStorageClass")
+		}},
+		"workload identity": {func(h *harness, _ *CreateRequest) {
+			mutateStorage(h, func(spec *everest.BackupStorageSpec) {
+				spec.Authentication = everest.Authentication{Mode: "WorkloadIdentity"}
+			})
+		}, func(err error) bool { return KindOf(err) == KindInvalid }},
+		"no bucket": {func(h *harness, _ *CreateRequest) {
+			mutateStorage(h, func(spec *everest.BackupStorageSpec) { spec.Location.ObjectStore = nil })
+		}, func(err error) bool { return KindOf(err) == KindInvalid }},
+		"CA key missing": {func(h *harness, _ *CreateRequest) { h.secrets.secrets["shop/minio-ca"] = map[string][]byte{} },
 			func(err error) bool { return KindOf(err) == KindInvalid }},
 	}
 	for name, test := range tests {

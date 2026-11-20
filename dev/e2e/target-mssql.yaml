@@ -1,8 +1,9 @@
 # OpenEverest SQL Server target (provider-mssql, standalone 2025) and the S3
 # BackupStorage the migration stages backups in. SQL Server reaches S3 over
-# HTTPS only and always verifies the certificate: with a private CA, put it
-# in the credentials Secret as ca.crt (provider-mssql mounts it into the
-# instances the storage is attached to). Replace the endpoint and keys.
+# HTTPS only and always verifies the certificate: with a private CA, name it
+# in tls.ca (provider-mssql mounts it into the instances the storage is
+# attached to). Replace the endpoint and keys. Needs OpenEverest
+# 2.0.0-alpha.1+.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -16,6 +17,13 @@ metadata:
 stringData:
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: change-me
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-ca
+  namespace: mssql-dst
+stringData:
   ca.crt: |
     -----BEGIN CERTIFICATE-----
     (the CA of the S3 endpoint's certificate)
@@ -27,15 +35,25 @@ metadata:
   name: minio
   namespace: mssql-dst
 spec:
-  type: s3
-  s3:
-    bucket: migrations
+  backupStorageClassRef:
+    name: s3
+  location:
+    objectStore:
+      bucket: migrations
+  parameters:
     region: us-east-1
     endpointURL: https://minio.minio.svc.cluster.local
     forcePathStyle: true
-    verifyTLS: true
+    implementation: minio
+  authentication:
+    mode: AccessKey
     credentialsSecretRef:
       name: minio-backup
+  tls:
+    ca:
+      secretKeyRef:
+        name: minio-ca
+        key: ca.crt
 ---
 apiVersion: core.openeverest.io/v1alpha1
 kind: Instance

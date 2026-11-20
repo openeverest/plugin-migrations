@@ -35,7 +35,9 @@ type Storage struct {
 	client *minio.Client
 }
 
-func newStorage(endpoint, bucket, region string, pathStyle bool, accessKey, secretKey, caFile, name string) (*Storage, error) {
+// newStorage stages the migration's objects under
+// [<storagePrefix>/]openeverest-migrations/<name>.
+func newStorage(endpoint, bucket, storagePrefix, region string, pathStyle bool, accessKey, secretKey, caFile, name string) (*Storage, error) {
 	parsed, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil || parsed.Host == "" {
 		return nil, errors.New("S3_ENDPOINT must be an https:// URL")
@@ -49,13 +51,22 @@ func newStorage(endpoint, bucket, region string, pathStyle bool, accessKey, secr
 	if bucket == "" || accessKey == "" || secretKey == "" {
 		return nil, errors.New("S3_BUCKET, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required")
 	}
+	prefix := keyRoot + "/" + name
+	if storagePrefix = strings.Trim(storagePrefix, "/"); storagePrefix != "" {
+		for segment := range strings.SplitSeq(storagePrefix, "/") {
+			if segment == "" || segment == "." || segment == ".." {
+				return nil, errors.New("S3_PREFIX must be a path without empty, '.' or '..' segments")
+			}
+		}
+		prefix = storagePrefix + "/" + prefix
+	}
 	// SQL Server separates the key ID and the secret with a colon.
 	if strings.Contains(accessKey, ":") {
 		return nil, errors.New("the S3 access key ID must not contain ':'")
 	}
 	storage := &Storage{
 		Endpoint: parsed, Bucket: bucket, Region: region, PathStyle: pathStyle,
-		AccessKey: accessKey, SecretKey: secretKey, CAFile: caFile, Prefix: keyRoot + "/" + name,
+		AccessKey: accessKey, SecretKey: secretKey, CAFile: caFile, Prefix: prefix,
 	}
 	transport, err := storage.transport()
 	if err != nil {

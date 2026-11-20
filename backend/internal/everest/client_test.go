@@ -123,16 +123,26 @@ func TestListInstances(t *testing.T) {
 func TestGetBackupStorage(t *testing.T) {
 	client := fakeEverest(t, map[string]func(http.ResponseWriter){
 		"/v1/clusters/main/namespaces/shop/backup-storages/minio": respond(200,
-			`{"metadata":{"name":"minio"},"spec":{"type":"s3","s3":{"bucket":"b","region":"r","endpointURL":"https://m",`+
-				`"forcePathStyle":true,"credentialsSecretRef":{"name":"creds"}}}}`),
+			`{"metadata":{"name":"minio"},"spec":{"backupStorageClassRef":{"name":"s3"},`+
+				`"location":{"objectStore":{"bucket":"b","prefix":"team-a/prod"}},`+
+				`"parameters":{"region":"r","endpointURL":"https://m","forcePathStyle":true,"implementation":"minio"},`+
+				`"authentication":{"mode":"AccessKey","credentialsSecretRef":{"name":"creds"}},`+
+				`"tls":{"ca":{"secretKeyRef":{"name":"ca","key":"ca.crt"}}}}}`),
 	})
 	spec, err := client.GetBackupStorage(context.Background(), "jwt", BackupStorageRef{"main", "shop", "minio"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Type != "s3" || spec.S3 == nil || spec.S3.Bucket != "b" || spec.S3.CredentialsSecretRef.Name != "creds" ||
-		spec.S3.ForcePathStyle == nil || !*spec.S3.ForcePathStyle || spec.S3.VerifyTLS != nil {
-		t.Fatalf("spec = %+v", spec)
+	parameters, err := spec.S3Parameters()
+	if err != nil || spec.Class() != "s3" || spec.ObjectStore() == nil || *spec.ObjectStore() != (ObjectStoreLocation{"b", "team-a/prod"}) ||
+		spec.Authentication.Mode != "AccessKey" || spec.Authentication.CredentialsSecretRef == nil ||
+		spec.Authentication.CredentialsSecretRef.Name != "creds" || spec.TLS == nil || spec.TLS.InsecureSkipVerify ||
+		spec.TLS.CA == nil || *spec.TLS.CA.SecretKeyRef != (SecretKeyRef{"ca", "ca.crt"}) {
+		t.Fatalf("spec = %+v (%v)", spec, err)
+	}
+	if parameters.Region != "r" || parameters.EndpointURL != "https://m" || parameters.ForcePathStyle == nil || !*parameters.ForcePathStyle ||
+		parameters.Implementation != "minio" {
+		t.Fatalf("parameters = %+v", parameters)
 	}
 	if _, err := client.GetBackupStorage(context.Background(), "jwt", BackupStorageRef{"main", "shop", "other"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing storage: %v", err)
@@ -142,14 +152,17 @@ func TestGetBackupStorage(t *testing.T) {
 func TestListBackupStorages(t *testing.T) {
 	client := fakeEverest(t, map[string]func(http.ResponseWriter){
 		"/v1/clusters/main/namespaces/shop/backup-storages": respond(200,
-			`{"items":[{"metadata":{"name":"zeta"},"spec":{"type":"s3","s3":{"bucket":"z","endpointURL":"https://z","credentialsSecretRef":{"name":"c"}}}},`+
-				`{"metadata":{"name":"alpha"},"spec":{"type":"s3","s3":{"bucket":"a","endpointURL":"https://a"}}},{"metadata":{}}]}`),
+			`{"items":[{"metadata":{"name":"zeta"},"spec":{"backupStorageClassRef":{"name":"s3"},"location":{"objectStore":{"bucket":"z"}},`+
+				`"parameters":{"endpointURL":"https://z","region":"r"},"authentication":{"mode":"AccessKey","credentialsSecretRef":{"name":"c"}}}},`+
+				`{"metadata":{"name":"alpha"},"spec":{"backupStorageClassRef":{"name":"azure"},"location":{"objectStore":{"bucket":"a"}},`+
+				`"parameters":{"endpointURL":42}}},{"metadata":{}}]}`),
 	})
 	storages, err := client.ListBackupStorages(context.Background(), "jwt", "main", "shop")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(storages) != 2 || storages[0].Name != "alpha" || storages[1].Bucket != "z" || storages[1].Endpoint != "https://z" {
+	if len(storages) != 2 || storages[0] != (BackupStorageSummary{Name: "alpha", Type: "azure", Bucket: "a"}) ||
+		storages[1] != (BackupStorageSummary{Name: "zeta", Type: "s3", Bucket: "z", Endpoint: "https://z"}) {
 		t.Fatalf("storages = %+v", storages)
 	}
 }

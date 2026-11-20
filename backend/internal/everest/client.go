@@ -142,24 +142,82 @@ type BackupStorageRef struct {
 	Name       string
 }
 
-// BackupStorageSpec is the credential-free S3 configuration of a
-// BackupStorage. Credentials live in the Secret it names.
+// BackupStorageSpec is the credential-free part of a BackupStorage
+// (backup.openeverest.io/v1alpha1, OpenEverest 2.0.0-alpha.1+). Credentials
+// and the CA bundle live in the Secrets it names.
 type BackupStorageSpec struct {
-	Type string           `json:"type"`
-	S3   *BackupStorageS3 `json:"s3"`
+	BackupStorageClassRef ObjectRef             `json:"backupStorageClassRef"`
+	Location              BackupStorageLocation `json:"location"`
+	// Parameters are validated against the class's schema, so their shape
+	// depends on the class: decode them with S3Parameters.
+	Parameters     json.RawMessage `json:"parameters"`
+	Authentication Authentication  `json:"authentication"`
+	TLS            *TLSConfig      `json:"tls"`
 }
 
-type BackupStorageS3 struct {
-	Bucket               string    `json:"bucket"`
-	Region               string    `json:"region"`
-	EndpointURL          string    `json:"endpointURL"`
-	VerifyTLS            *bool     `json:"verifyTLS"`
-	ForcePathStyle       *bool     `json:"forcePathStyle"`
-	CredentialsSecretRef SecretRef `json:"credentialsSecretRef"`
+// Class returns the name of the storage's BackupStorageClass, e.g. "s3".
+func (s BackupStorageSpec) Class() string { return s.BackupStorageClassRef.Name }
+
+// ObjectStore returns the storage's bucket location, or nil.
+func (s BackupStorageSpec) ObjectStore() *ObjectStoreLocation { return s.Location.ObjectStore }
+
+type ObjectRef struct {
+	Name string `json:"name"`
+}
+
+type BackupStorageLocation struct {
+	ObjectStore *ObjectStoreLocation `json:"objectStore"`
+}
+
+// ObjectStoreLocation is a bucket and an optional prefix within it, without
+// slashes at either end.
+type ObjectStoreLocation struct {
+	Bucket string `json:"bucket"`
+	Prefix string `json:"prefix"`
+}
+
+// S3Parameters decodes the parameters of the core "s3" BackupStorageClass.
+func (s BackupStorageSpec) S3Parameters() (S3Parameters, error) {
+	var parameters S3Parameters
+	if len(s.Parameters) == 0 || string(s.Parameters) == "null" {
+		return parameters, nil
+	}
+	// Decoder errors can quote values; keep them out of the message.
+	if err := json.Unmarshal(s.Parameters, &parameters); err != nil {
+		return S3Parameters{}, errors.New("invalid s3 parameters")
+	}
+	return parameters, nil
+}
+
+// S3Parameters are the parameters of the core "s3" BackupStorageClass.
+type S3Parameters struct {
+	Region         string `json:"region"`
+	EndpointURL    string `json:"endpointURL"`
+	ForcePathStyle *bool  `json:"forcePathStyle"`
+	Implementation string `json:"implementation"`
+}
+
+type Authentication struct {
+	Mode                 string     `json:"mode"`
+	CredentialsSecretRef *SecretRef `json:"credentialsSecretRef"`
 }
 
 type SecretRef struct {
 	Name string `json:"name"`
+}
+
+type TLSConfig struct {
+	CA                 *CABundleSource `json:"ca"`
+	InsecureSkipVerify bool            `json:"insecureSkipVerify"`
+}
+
+type CABundleSource struct {
+	SecretKeyRef *SecretKeyRef `json:"secretKeyRef"`
+}
+
+type SecretKeyRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
 }
 
 // BackupStorageSummary is credential-free backup storage metadata for pickers.
@@ -189,9 +247,12 @@ func (c *Client) ListBackupStorages(ctx context.Context, token, k8sCluster, name
 		if item.Metadata.Name == "" {
 			continue
 		}
-		summary := BackupStorageSummary{Name: item.Metadata.Name, Type: item.Spec.Type}
-		if item.Spec.S3 != nil {
-			summary.Bucket, summary.Endpoint = item.Spec.S3.Bucket, item.Spec.S3.EndpointURL
+		summary := BackupStorageSummary{Name: item.Metadata.Name, Type: item.Spec.Class()}
+		if location := item.Spec.ObjectStore(); location != nil {
+			summary.Bucket = location.Bucket
+		}
+		if parameters, err := item.Spec.S3Parameters(); err == nil {
+			summary.Endpoint = parameters.EndpointURL
 		}
 		storages = append(storages, summary)
 	}
